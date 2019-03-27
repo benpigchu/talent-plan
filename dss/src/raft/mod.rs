@@ -259,4 +259,8 @@ impl RaftService for Node {
         // Your code here (2A, 2B).
         unimplemented!()
     }
+    fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        // Your code here (2A, 2B).
+        unimplemented!()
+    }
 }
