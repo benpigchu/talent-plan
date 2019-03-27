@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -61,7 +62,6 @@ pub struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
-
     current_term: u64,
 
     // if leader is self, we are leader
@@ -71,10 +71,9 @@ pub struct Raft {
     // elsewise, we are follower
 
     // special states for candidate
-
-
+    votes_responded: HashSet<u64>,
+    votes_granted: HashSet<u64>,
     // special states for leader
-
 }
 
 impl Raft {
@@ -103,6 +102,8 @@ impl Raft {
             current_term: 0,
             voted_for: None,
             leader_id: None,
+            votes_responded: HashSet::new(),
+            votes_granted: HashSet::new(),
         };
 
         // initialize from state persisted before a crash
