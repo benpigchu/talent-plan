@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use futures::sync::mpsc::UnboundedSender;
 use futures::Future;
@@ -41,6 +42,13 @@ impl State {
     }
 }
 
+#[derive(PartialEq)]
+enum RoleState {
+    Follower,
+    Candidate,
+    Leader,
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -49,10 +57,24 @@ pub struct Raft {
     persister: Box<dyn Persister>,
     // this peer's index into peers[]
     me: usize,
-    state: Arc<State>,
+    // state: Arc<State>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
+
+    current_term: u64,
+
+    // if leader is self, we are leader
+    leader_id: Option<u64>,
+    // if voted for self, we are candidate
+    voted_for: Option<u64>,
+    // elsewise, we are follower
+
+    // special states for candidate
+
+
+    // special states for leader
+
 }
 
 impl Raft {
@@ -77,13 +99,27 @@ impl Raft {
             peers,
             persister,
             me,
-            state: Arc::default(),
+            // state: Arc::default(),
+            current_term: 0,
+            voted_for: None,
+            leader_id: None,
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
         rf
+    }
+
+    /// a helper used to get the current role state
+    fn role_state(&self) -> RoleState {
+        if self.leader_id == Some(self.me as u64) {
+            return RoleState::Leader;
+        }
+        if self.voted_for == Some(self.me as u64) {
+            return RoleState::Candidate;
+        }
+        RoleState::Follower
     }
 
     /// save Raft's persistent state to stable storage,
@@ -188,13 +224,17 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
+    raft: Arc<Mutex<Raft>>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        Node {}
+        Node {
+            raft: Arc::new(Mutex::new(raft)),
+        }
+        // TODO: start a background timer here
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -225,7 +265,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        unimplemented!()
+        self.raft.lock().unwrap().current_term
     }
 
     /// Whether this peer believes it is the leader.
@@ -233,7 +273,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        unimplemented!()
+        self.raft.lock().unwrap().role_state() == RoleState::Leader
     }
 
     /// The current state of this peer.
