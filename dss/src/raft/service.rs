@@ -24,22 +24,22 @@ pub struct RequestVoteArgs {
 #[derive(Clone, PartialEq, Message)]
 pub struct RequestVoteReply {
     // Your data here (2A).
-    #[prost(int64, tag = "1")]
-    pub term: i64,
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
     #[prost(bool, tag = "2")]
     pub vote_granted: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct AppendEntriesArgs {
-    #[prost(int64, tag = "1")]
-    pub term: i64,
-    #[prost(int64, tag = "2")]
-    pub leader_id: i64,
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
+    #[prost(uint64, tag = "2")]
+    pub leader_id: u64,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct AppendEntriesReply {
-    #[prost(int64, tag = "1")]
-    pub term: i64,
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
 }
