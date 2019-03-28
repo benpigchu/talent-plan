@@ -75,7 +75,7 @@ enum TimeoutType {
 /// type of task to be processed
 #[derive(Debug)]
 enum Task {
-    Request(Incoming),
+    Packet(Incoming),
     Timeout(TimeoutType),
 }
 
@@ -308,6 +308,41 @@ impl Raft {
         self.request_vote(timing, &sender);
     }
 
+    fn checkout_term(&mut self, term: u64) {
+        if term > self.current_term {
+            //update term
+            self.current_term = term;
+            //convert to follower
+            self.leader_id = None;
+            self.voted_for = None;
+        }
+    }
+
+    fn process_request_vote(
+        &mut self,
+        args: RequestVoteArgs,
+        sender: oneshot::Sender<RequestVoteReply>,
+    ) {
+        self.checkout_term(args.term);
+        // TODO: log related vote
+        let vote = if self.current_term > args.term {
+            false
+        } else if let Some(id) = self.voted_for {
+            id == args.candidate_id
+        } else {
+            true
+        };
+        if vote {
+            self.voted_for = Some(args.candidate_id)
+        }
+        sender
+            .send(RequestVoteReply {
+                term: self.current_term,
+                vote_granted: vote,
+            })
+            .unwrap_or_default();
+    }
+
     fn process_task(
         &mut self,
         task: Task,
@@ -321,10 +356,6 @@ impl Raft {
             (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {
                 self.start_election(timing, &sender)
             }
-            (RoleState::Follower, _) => {
-                // election timeout or incoming message
-                unimplemented!()
-            }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Heartbeat)) => {
                 self.reset_heartbeat_timeout(timing);
                 self.request_vote(timing, &sender)
@@ -332,13 +363,15 @@ impl Raft {
             (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => {
                 self.start_election(timing, &sender)
             }
-            (RoleState::Candidate, _) => {
-                // [re-request vote or election timeout] or incoming term update
-                unimplemented!()
+            (RoleState::Leader, Task::Timeout(TimeoutType::Heartbeat)) => unimplemented!(),
+            (RoleState::Leader, Task::Timeout(TimeoutType::Election)) => {
+                panic!("Leader should not has heartbeat timeout")
             }
-            (RoleState::Leader, _) => {
-                // heartbeat or incoming term update
-                unimplemented!()
+            (_, Task::Packet(Incoming::RequestVote(arg, sender))) => {
+                self.process_request_vote(arg, sender)
+            }
+            (_, _) => {
+                //discard other tasks
             }
         }
     }
@@ -491,7 +524,7 @@ fn raft_thread(
         let (task, new_receiver_future) = match wait_result {
             Ok(Either::A(((message, stream), _))) => {
                 if let Some(incoming) = message {
-                    (Task::Request(incoming), stream.into_future())
+                    (Task::Packet(incoming), stream.into_future())
                 } else {
                     // no more incoming message to execute, the sender is dropped and the node is destroyed
                     info!("Raft #{:?}: Node destroyed", raft.me);
