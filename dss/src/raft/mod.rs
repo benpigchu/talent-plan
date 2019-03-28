@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 
-use futures::sync::mpsc::UnboundedSender;
+use futures::sync::{mpsc, oneshot};
 use futures::Future;
 use labcodec;
 use labrpc::RpcFuture;
@@ -89,7 +90,7 @@ impl Raft {
         peers: Vec<RaftClient>,
         me: usize,
         persister: Box<dyn Persister>,
-        apply_ch: UnboundedSender<ApplyMsg>,
+        apply_ch: mpsc::UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
 
@@ -208,6 +209,11 @@ impl Raft {
     }
 }
 
+enum Incoming {
+    RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
+    AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
+}
+
 // Choose concurrency paradigm.
 //
 // You can either drive the raft state machine by the rpc framework,
@@ -225,17 +231,22 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
-    raft: Arc<Mutex<Raft>>,
+    sender: mpsc::UnboundedSender<Incoming>,
+    state: Arc<Mutex<State>>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        Node {
-            raft: Arc::new(Mutex::new(raft)),
-        }
-        // TODO: start a background timer here
+        let (sender, receiver) = mpsc::unbounded::<Incoming>();
+        let state = Arc::new(Mutex::new(State {
+            term: 0,
+            is_leader: false,
+        }));
+        let state_clone = state.clone();
+        thread::spawn(move || raft_thread(raft, state_clone, receiver));
+        Node { sender, state }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -266,7 +277,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        self.raft.lock().unwrap().current_term
+        self.get_state().term()
     }
 
     /// Whether this peer believes it is the leader.
@@ -274,15 +285,12 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        self.raft.lock().unwrap().role_state() == RoleState::Leader
+        self.get_state().is_leader()
     }
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
-        State {
-            term: self.term(),
-            is_leader: self.is_leader(),
-        }
+        (*self.state.lock().unwrap()).clone()
     }
 
     /// the tester calls kill() when a Raft instance won't
@@ -298,10 +306,37 @@ impl RaftService for Node {
     // example RequestVote RPC handler.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        unimplemented!()
+        let (sender, receiver) = oneshot::channel::<RequestVoteReply>();
+        self.sender
+            .unbounded_send(Incoming::RequestVote(args, sender))
+            .unwrap();
+        Box::new(receiver.map_err(labrpc::Error::Recv))
     }
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         // Your code here (2A, 2B).
-        unimplemented!()
+        let (sender, receiver) = oneshot::channel::<AppendEntriesReply>();
+        self.sender
+            .unbounded_send(Incoming::AppendEntries(args, sender))
+            .unwrap();
+        Box::new(receiver.map_err(labrpc::Error::Recv))
+    }
+}
+
+fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedReceiver<Incoming>) {
+    loop {
+        // update timer
+        // wait for message+timer
+        // process message/timeout
+        match raft.role_state() {
+            RoleState::Follower => {
+                // election timeout or incoming message
+            }
+            RoleState::Candidate => {
+                // [re-request vote or election timeout] or incoming term update
+            }
+            RoleState::Leader => {
+                // heartbeat or incoming term update
+            }
+        }
     }
 }
