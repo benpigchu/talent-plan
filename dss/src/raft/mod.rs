@@ -120,8 +120,8 @@ pub struct Raft {
     // elsewise, we are follower
 
     // special states for candidate
-    votes_responded: HashSet<u64>,
-    votes_not_granted: HashSet<u64>,
+    votes_granted: HashSet<u64>,
+    votes_not_respond: HashSet<u64>,
     // special states for leader
 }
 
@@ -151,8 +151,8 @@ impl Raft {
             current_term: 0,
             voted_for: None,
             leader_id: None,
-            votes_responded: HashSet::new(),
-            votes_not_granted: HashSet::new(),
+            votes_granted: HashSet::new(),
+            votes_not_respond: HashSet::new(),
         };
 
         // initialize from state persisted before a crash
@@ -274,7 +274,7 @@ impl Raft {
     }
 
     fn request_vote(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
-        for id in &self.votes_not_granted {
+        for id in &self.votes_not_respond {
             self.send_request_vote(
                 *id as usize,
                 &RequestVoteArgs {
@@ -292,12 +292,12 @@ impl Raft {
         //init vote states
         self.leader_id = None;
         self.voted_for = Some(self.me as u64);
-        self.votes_responded.clear();
-        self.votes_responded.insert(self.me as u64);
-        self.votes_not_granted.clear();
+        self.votes_granted.clear();
+        self.votes_granted.insert(self.me as u64);
+        self.votes_not_respond.clear();
         for id in 0..self.peers.len() {
             if id != self.me {
-                self.votes_not_granted.insert(self.me as u64);
+                self.votes_not_respond.insert(id as u64);
             }
         }
         //update timers
@@ -308,13 +308,20 @@ impl Raft {
         self.request_vote(timing, &sender);
     }
 
-    fn checkout_term(&mut self, term: u64) {
+    fn generic_request_handler(&mut self, term: u64, timing: &mut Timing) {
         if term > self.current_term {
             //update term
             self.current_term = term;
             //convert to follower
             self.leader_id = None;
             self.voted_for = None;
+            //reset timing
+            let current_time = time::Instant::now();
+            timing.heartbeat_timeout = None;
+            timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
+        } else if timing.election_timeout.is_some() {
+            let current_time = time::Instant::now();
+            timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
         }
     }
 
@@ -322,8 +329,9 @@ impl Raft {
         &mut self,
         args: RequestVoteArgs,
         sender: oneshot::Sender<RequestVoteReply>,
+        timing: &mut Timing,
     ) {
-        self.checkout_term(args.term);
+        self.generic_request_handler(args.term, timing);
         // TODO: log related vote
         let vote = if self.current_term > args.term {
             false
@@ -341,6 +349,23 @@ impl Raft {
                 vote_granted: vote,
             })
             .unwrap_or_default();
+    }
+
+    fn becomes_leader(&mut self) {
+        info!("Raft #{:?}: Becomes leader", self.me)
+    }
+
+    fn process_vote(&mut self, id: u64, reply: RequestVoteReply, timing: &mut Timing) {
+        self.generic_request_handler(reply.term, timing);
+        if self.role_state() == RoleState::Candidate {
+            self.votes_not_respond.remove(&id);
+            if reply.vote_granted {
+                self.votes_granted.insert(id);
+            }
+            if self.votes_granted.len() * 2 > self.peers.len() {
+                self.becomes_leader()
+            }
+        }
     }
 
     fn process_task(
@@ -368,8 +393,9 @@ impl Raft {
                 panic!("Leader should not has heartbeat timeout")
             }
             (_, Task::Packet(Incoming::RequestVote(arg, sender))) => {
-                self.process_request_vote(arg, sender)
+                self.process_request_vote(arg, sender, timing)
             }
+            (_, Task::Packet(Incoming::Vote(id, reply))) => self.process_vote(id, reply, timing),
             (_, _) => {
                 //discard other tasks
             }
@@ -473,7 +499,7 @@ impl RaftService for Node {
         let (sender, receiver) = oneshot::channel::<RequestVoteReply>();
         self.sender
             .unbounded_send(Incoming::RequestVote(args, sender))
-            .unwrap();
+            .unwrap_or_default();
         Box::new(receiver.map_err(labrpc::Error::Recv))
     }
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
@@ -481,7 +507,7 @@ impl RaftService for Node {
         let (sender, receiver) = oneshot::channel::<AppendEntriesReply>();
         self.sender
             .unbounded_send(Incoming::AppendEntries(args, sender))
-            .unwrap();
+            .unwrap_or_default();
         Box::new(receiver.map_err(labrpc::Error::Recv))
     }
 }
