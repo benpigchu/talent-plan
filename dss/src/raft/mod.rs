@@ -2,11 +2,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
+use std::time;
 
+use futures::future::Either;
 use futures::sync::{mpsc, oneshot};
-use futures::Future;
+use futures::{Future, Stream};
+use futures_timer::Delay;
 use labcodec;
 use labrpc::RpcFuture;
+use rand::{Rng, ThreadRng};
 
 #[cfg(test)]
 pub mod config;
@@ -209,6 +213,7 @@ impl Raft {
     }
 }
 
+#[derive(Debug)]
 enum Incoming {
     RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
     AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
@@ -322,10 +327,66 @@ impl RaftService for Node {
     }
 }
 
+const ELECTION_TIMEOUT_MIN: u64 = 300;
+const ELECTION_TIMEOUT_MAX: u64 = 600;
+const HEARTBEAT_TIMEOUT: u64 = 100;
+
+fn gen_election_timeout(rng: &mut ThreadRng) -> u64 {
+    rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+}
+
+#[derive(Debug)]
+enum TimeoutType {
+    Heartbeat,
+    Election,
+}
+
+#[derive(Debug)]
+enum Task {
+    Request(Incoming),
+    Timeout(TimeoutType),
+}
+
 fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedReceiver<Incoming>) {
+    #![allow(unused_mut)]
+    let mut rng = rand::thread_rng();
+    let mut last_time = time::Instant::now();
+    let mut heartbeat_timeout: Option<time::Instant> = None;
+    let mut election_timeout =
+        Some(last_time + time::Duration::from_millis(gen_election_timeout(&mut rng)));
+    let mut receiver_future = receiver.into_future();
     loop {
-        // update timer
+        // select next timeout
+        let (timeout_instant, timeout_type) = match (heartbeat_timeout, election_timeout) {
+            (Some(heartbeat), Some(election)) => {
+                if election > heartbeat {
+                    (heartbeat, TimeoutType::Heartbeat)
+                } else {
+                    (election, TimeoutType::Election)
+                }
+            }
+            (None, Some(election)) => (election, TimeoutType::Election),
+            (Some(heartbeat), None) => (heartbeat, TimeoutType::Heartbeat),
+            (None, None) => panic!("I have nothing to wait for"),
+        };
+        let timeout = Delay::new_at(timeout_instant);
         // wait for message+timer
+        let wait_result = receiver_future.select2(timeout).wait();
+        let (task, new_receiver_future) = match wait_result {
+            Ok(Either::A(((message, stream), _))) => {
+                if let Some(incoming) = message {
+                    (Task::Request(incoming), stream.into_future())
+                } else {
+                    // no more incoming message to execute,
+                    return;
+                }
+            }
+            Err(Either::A(((error, stream), _))) => panic!("My channel gives me an error!"),
+            Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
+            Err(Either::B((error, stream_future))) => panic!("My timer gives me an error!"),
+        };
+        info!("{:?}", task);
+        receiver_future = new_receiver_future;
         // process message/timeout
         match raft.role_state() {
             RoleState::Follower => {
@@ -338,5 +399,9 @@ fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedRe
                 // heartbeat or incoming term update
             }
         }
+        // update timer
+        let current_time = time::Instant::now();
+        let delta = current_time - last_time;
+        last_time = current_time;
     }
 }
