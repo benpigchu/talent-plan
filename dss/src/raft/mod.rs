@@ -219,23 +219,28 @@ impl Raft {
     /// is no need to implement your own timeouts around this method.
     ///
     /// look at the comments in ../labrpc/src/mod.rs for more details.
-    fn send_request_vote(&self, server: usize, args: &RequestVoteArgs) -> Result<RequestVoteReply> {
+    fn send_request_vote(
+        &self,
+        server: usize,
+        args: &RequestVoteArgs,
+        sender: &mpsc::UnboundedSender<Incoming>,
+    ) {
         let peer = &self.peers[server];
         // Your code here if you want the rpc becomes async.
         // Example:
         // ```
         // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             OK(())
-        //         }),
-        // );
-        // rx.wait() ...
-        // ```
-        peer.request_vote(&args).map_err(Error::Rpc).wait()
+        let sender_clone = sender.clone();
+        peer.spawn(
+            peer.request_vote(&args)
+                .map_err(|err| ())
+                .and_then(move |res| {
+                    sender_clone
+                        .unbounded_send(Incoming::Vote(server as u64, res))
+                        .unwrap();
+                    Ok(())
+                }),
+        );
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -268,11 +273,20 @@ impl Raft {
         timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
     }
 
-    fn request_vote(&mut self, timing: &mut Timing) {
-        self.reset_heartbeat_timeout(timing)
+    fn request_vote(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
+        for id in &self.votes_not_granted {
+            self.send_request_vote(
+                *id as usize,
+                &RequestVoteArgs {
+                    term: self.current_term,
+                    candidate_id: self.me as u64,
+                },
+                &sender,
+            )
+        }
     }
 
-    fn start_election(&mut self, timing: &mut Timing) {
+    fn start_election(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
         //go to a higher term
         self.current_term += 1;
         //init vote states
@@ -291,26 +305,32 @@ impl Raft {
         timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
         timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
         //send vote request
-        self.request_vote(timing);
+        self.request_vote(timing, &sender);
     }
 
-    fn process_task(&mut self, task: Task, timing: &mut Timing) {
+    fn process_task(
+        &mut self,
+        task: Task,
+        timing: &mut Timing,
+        sender: &mpsc::UnboundedSender<Incoming>,
+    ) {
         match (self.role_state(), task) {
             (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
                 panic!("Follower should not has heartbeat timeout")
             }
             (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {
-                self.start_election(timing)
+                self.start_election(timing, &sender)
             }
             (RoleState::Follower, _) => {
                 // election timeout or incoming message
                 unimplemented!()
             }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Heartbeat)) => {
-                self.request_vote(timing)
+                self.reset_heartbeat_timeout(timing);
+                self.request_vote(timing, &sender)
             }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => {
-                self.start_election(timing)
+                self.start_election(timing, &sender)
             }
             (RoleState::Candidate, _) => {
                 // [re-request vote or election timeout] or incoming term update
@@ -350,12 +370,13 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         // Your code here.
         let (sender, receiver) = mpsc::unbounded::<Incoming>();
+        let sender_clone = sender.clone();
         let state = Arc::new(Mutex::new(State {
             term: 0,
             is_leader: false,
         }));
         let state_clone = state.clone();
-        thread::spawn(move || raft_thread(raft, state_clone, receiver));
+        thread::spawn(move || raft_thread(raft, state_clone, receiver, sender_clone));
         Node { sender, state }
     }
 
@@ -432,7 +453,12 @@ impl RaftService for Node {
     }
 }
 
-fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedReceiver<Incoming>) {
+fn raft_thread(
+    raft: Raft,
+    state: Arc<Mutex<State>>,
+    receiver: mpsc::UnboundedReceiver<Incoming>,
+    sender: mpsc::UnboundedSender<Incoming>,
+) {
     let mut raft = raft;
     let mut rng = rand::thread_rng();
     let start_time = time::Instant::now();
@@ -480,7 +506,7 @@ fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedRe
         receiver_future = new_receiver_future;
 
         // process message/timeout
-        raft.process_task(task, &mut timing);
+        raft.process_task(task, &mut timing, &sender);
 
         //update state
         *state.lock().unwrap() = raft.state();
