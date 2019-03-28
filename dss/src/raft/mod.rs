@@ -82,8 +82,21 @@ enum Task {
 /// infomation related to timers
 #[derive(Debug)]
 struct Timing {
+    rng: ThreadRng,
     heartbeat_timeout: Option<time::Instant>,
     election_timeout: Option<time::Instant>,
+}
+
+const ELECTION_TIMEOUT_MIN: u64 = 300;
+const ELECTION_TIMEOUT_MAX: u64 = 600;
+const HEARTBEAT_TIMEOUT: u64 = 100;
+
+fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
+    time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
+}
+
+fn gen_heartbeat_timeout(rng: &mut ThreadRng) -> time::Duration {
+    time::Duration::from_millis(HEARTBEAT_TIMEOUT)
 }
 
 // A single Raft peer.
@@ -108,7 +121,7 @@ pub struct Raft {
 
     // special states for candidate
     votes_responded: HashSet<u64>,
-    votes_granted: HashSet<u64>,
+    votes_not_granted: HashSet<u64>,
     // special states for leader
 }
 
@@ -139,7 +152,7 @@ impl Raft {
             voted_for: None,
             leader_id: None,
             votes_responded: HashSet::new(),
-            votes_granted: HashSet::new(),
+            votes_not_granted: HashSet::new(),
         };
 
         // initialize from state persisted before a crash
@@ -250,15 +263,54 @@ impl Raft {
         }
     }
 
+    fn reset_heartbeat_timeout(&mut self, timing: &mut Timing) {
+        let current_time = time::Instant::now();
+        timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
+    }
+
+    fn request_vote(&mut self, timing: &mut Timing) {
+        self.reset_heartbeat_timeout(timing)
+    }
+
+    fn start_election(&mut self, timing: &mut Timing) {
+        //go to a higher term
+        self.current_term += 1;
+        //init vote states
+        self.leader_id = None;
+        self.voted_for = Some(self.me as u64);
+        self.votes_responded.clear();
+        self.votes_responded.insert(self.me as u64);
+        self.votes_not_granted.clear();
+        for id in 0..self.peers.len() {
+            if id != self.me {
+                self.votes_not_granted.insert(self.me as u64);
+            }
+        }
+        //update timers
+        let current_time = time::Instant::now();
+        timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
+        timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
+        //send vote request
+        self.request_vote(timing);
+    }
+
     fn process_task(&mut self, task: Task, timing: &mut Timing) {
         match (self.role_state(), task) {
             (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
                 panic!("Follower should not has heartbeat timeout")
             }
-            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {}
+            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {
+                self.start_election(timing)
+            }
             (RoleState::Follower, _) => {
                 // election timeout or incoming message
                 unimplemented!()
+            }
+            (RoleState::Candidate, Task::Timeout(TimeoutType::Heartbeat)) => {
+                self.request_vote(timing)
+            }
+            (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => {
+                self.start_election(timing)
             }
             (RoleState::Candidate, _) => {
                 // [re-request vote or election timeout] or incoming term update
@@ -380,21 +432,15 @@ impl RaftService for Node {
     }
 }
 
-const ELECTION_TIMEOUT_MIN: u64 = 300;
-const ELECTION_TIMEOUT_MAX: u64 = 600;
-const HEARTBEAT_TIMEOUT: u64 = 100;
-
-fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
-    time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
-}
-
 fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedReceiver<Incoming>) {
     let mut raft = raft;
     let mut rng = rand::thread_rng();
     let start_time = time::Instant::now();
+    let init_election_timeout = gen_election_timeout(&mut rng);
     let mut timing = Timing {
+        rng,
         heartbeat_timeout: None,
-        election_timeout: Some(start_time + gen_election_timeout(&mut rng)),
+        election_timeout: Some(start_time + init_election_timeout),
     };
     let mut receiver_future = receiver.into_future();
     loop {
