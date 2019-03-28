@@ -48,11 +48,42 @@ impl State {
     }
 }
 
-#[derive(PartialEq)]
+/// The current role of the node
+#[derive(PartialEq, Debug)]
 enum RoleState {
     Follower,
     Candidate,
     Leader,
+}
+
+/// type of messages recieved from other
+#[derive(Debug)]
+enum Incoming {
+    RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
+    AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
+    Vote(u64, RequestVoteReply),
+    Feedback(u64, AppendEntriesReply),
+}
+
+/// type of timer timeout
+#[derive(Debug)]
+enum TimeoutType {
+    Heartbeat,
+    Election,
+}
+
+/// type of task to be processed
+#[derive(Debug)]
+enum Task {
+    Request(Incoming),
+    Timeout(TimeoutType),
+}
+
+/// infomation related to timers
+#[derive(Debug)]
+struct Timing {
+    heartbeat_timeout: Option<time::Instant>,
+    election_timeout: Option<time::Instant>,
 }
 
 // A single Raft peer.
@@ -211,12 +242,34 @@ impl Raft {
             Err(Error::NotLeader)
         }
     }
-}
 
-#[derive(Debug)]
-enum Incoming {
-    RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
-    AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
+    fn state(&self) -> State {
+        State {
+            term: self.current_term,
+            is_leader: self.role_state() == RoleState::Leader,
+        }
+    }
+
+    fn process_task(&mut self, task: Task, timing: &mut Timing) {
+        match (self.role_state(), task) {
+            (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
+                panic!("Follower should not has heartbeat timeout")
+            }
+            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {}
+            (RoleState::Follower, _) => {
+                // election timeout or incoming message
+                unimplemented!()
+            }
+            (RoleState::Candidate, _) => {
+                // [re-request vote or election timeout] or incoming term update
+                unimplemented!()
+            }
+            (RoleState::Leader, _) => {
+                // heartbeat or incoming term update
+                unimplemented!()
+            }
+        }
+    }
 }
 
 // Choose concurrency paradigm.
@@ -335,31 +388,11 @@ fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
 }
 
-#[derive(Debug)]
-enum TimeoutType {
-    Heartbeat,
-    Election,
-}
-
-#[derive(Debug)]
-enum Task {
-    Request(Incoming),
-    Timeout(TimeoutType),
-}
-
-#[derive(Debug)]
-struct Timing {
-    last_time: time::Instant,
-    heartbeat_timeout: Option<time::Instant>,
-    election_timeout: Option<time::Instant>,
-}
-
 fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedReceiver<Incoming>) {
     let mut raft = raft;
     let mut rng = rand::thread_rng();
-    let start_time=time::Instant::now();
+    let start_time = time::Instant::now();
     let mut timing = Timing {
-        last_time: start_time,
         heartbeat_timeout: None,
         election_timeout: Some(start_time + gen_election_timeout(&mut rng)),
     };
@@ -401,28 +434,9 @@ fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedRe
         receiver_future = new_receiver_future;
 
         // process message/timeout
-        match (raft.role_state(), task) {
-            (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
-                panic!("Follower should not has heartbeat timeout")
-            }
-            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {}
-            (RoleState::Follower, _) => {
-                // election timeout or incoming message
-                unimplemented!()
-            }
-            (RoleState::Candidate, _) => {
-                // [re-request vote or election timeout] or incoming term update
-                unimplemented!()
-            }
-            (RoleState::Leader, _) => {
-                // heartbeat or incoming term update
-                unimplemented!()
-            }
-        }
+        raft.process_task(task, &mut timing);
 
-        // update timer
-        let current_time = time::Instant::now();
-        let delta = current_time - timing.last_time;
-        timing.last_time = current_time;
+        //update state
+        *state.lock().unwrap() = raft.state();
     }
 }
