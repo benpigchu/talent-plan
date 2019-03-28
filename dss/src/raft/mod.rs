@@ -331,8 +331,8 @@ const ELECTION_TIMEOUT_MIN: u64 = 300;
 const ELECTION_TIMEOUT_MAX: u64 = 600;
 const HEARTBEAT_TIMEOUT: u64 = 100;
 
-fn gen_election_timeout(rng: &mut ThreadRng) -> u64 {
-    rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX)
+fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
+    time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
 }
 
 #[derive(Debug)]
@@ -347,29 +347,40 @@ enum Task {
     Timeout(TimeoutType),
 }
 
+#[derive(Debug)]
+struct Timing {
+    last_time: time::Instant,
+    heartbeat_timeout: Option<time::Instant>,
+    election_timeout: Option<time::Instant>,
+}
+
 fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedReceiver<Incoming>) {
-    #![allow(unused_mut)]
+    let mut raft = raft;
     let mut rng = rand::thread_rng();
-    let mut last_time = time::Instant::now();
-    let mut heartbeat_timeout: Option<time::Instant> = None;
-    let mut election_timeout =
-        Some(last_time + time::Duration::from_millis(gen_election_timeout(&mut rng)));
+    let start_time=time::Instant::now();
+    let mut timing = Timing {
+        last_time: start_time,
+        heartbeat_timeout: None,
+        election_timeout: Some(start_time + gen_election_timeout(&mut rng)),
+    };
     let mut receiver_future = receiver.into_future();
     loop {
         // select next timeout
-        let (timeout_instant, timeout_type) = match (heartbeat_timeout, election_timeout) {
-            (Some(heartbeat), Some(election)) => {
-                if election > heartbeat {
-                    (heartbeat, TimeoutType::Heartbeat)
-                } else {
-                    (election, TimeoutType::Election)
+        let (timeout_instant, timeout_type) =
+            match (timing.heartbeat_timeout, timing.election_timeout) {
+                (Some(heartbeat), Some(election)) => {
+                    if election > heartbeat {
+                        (heartbeat, TimeoutType::Heartbeat)
+                    } else {
+                        (election, TimeoutType::Election)
+                    }
                 }
-            }
-            (None, Some(election)) => (election, TimeoutType::Election),
-            (Some(heartbeat), None) => (heartbeat, TimeoutType::Heartbeat),
-            (None, None) => panic!("I have nothing to wait for"),
-        };
+                (None, Some(election)) => (election, TimeoutType::Election),
+                (Some(heartbeat), None) => (heartbeat, TimeoutType::Heartbeat),
+                (None, None) => panic!("I have nothing to wait for"),
+            };
         let timeout = Delay::new_at(timeout_instant);
+
         // wait for message+timer
         let wait_result = receiver_future.select2(timeout).wait();
         let (task, new_receiver_future) = match wait_result {
@@ -377,7 +388,8 @@ fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedRe
                 if let Some(incoming) = message {
                     (Task::Request(incoming), stream.into_future())
                 } else {
-                    // no more incoming message to execute,
+                    // no more incoming message to execute, the sender is dropped and the node is destroyed
+                    info!("Raft #{:?}: Node destroyed", raft.me);
                     return;
                 }
             }
@@ -385,23 +397,32 @@ fn raft_thread(raft: Raft, state: Arc<Mutex<State>>, receiver: mpsc::UnboundedRe
             Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
             Err(Either::B((error, stream_future))) => panic!("My timer gives me an error!"),
         };
-        info!("{:?}", task);
+        info!("Raft #{:?}: Get task {:?}", raft.me, task);
         receiver_future = new_receiver_future;
+
         // process message/timeout
-        match raft.role_state() {
-            RoleState::Follower => {
+        match (raft.role_state(), task) {
+            (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
+                panic!("Follower should not has heartbeat timeout")
+            }
+            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {}
+            (RoleState::Follower, _) => {
                 // election timeout or incoming message
+                unimplemented!()
             }
-            RoleState::Candidate => {
+            (RoleState::Candidate, _) => {
                 // [re-request vote or election timeout] or incoming term update
+                unimplemented!()
             }
-            RoleState::Leader => {
+            (RoleState::Leader, _) => {
                 // heartbeat or incoming term update
+                unimplemented!()
             }
         }
+
         // update timer
         let current_time = time::Instant::now();
-        let delta = current_time - last_time;
-        last_time = current_time;
+        let delta = current_time - timing.last_time;
+        timing.last_time = current_time;
     }
 }
