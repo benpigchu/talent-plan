@@ -94,6 +94,38 @@ struct Timing {
     election_timeout: Option<time::Instant>,
 }
 
+impl Timing {
+    fn reset_heartbeat_timeout(&mut self) {
+        if self.heartbeat_timeout.is_some() {
+            let current_time = time::Instant::now();
+            self.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut self.rng));
+        }
+    }
+    fn reset_election_timeout(&mut self) {
+        if self.election_timeout.is_some() {
+            let current_time = time::Instant::now();
+            self.election_timeout = Some(current_time + gen_election_timeout(&mut self.rng));
+        }
+    }
+    fn reset_when_becomes(&mut self, state: RoleState) {
+        let current_time = time::Instant::now();
+        match state {
+            RoleState::Follower => {
+                self.election_timeout = Some(current_time + gen_election_timeout(&mut self.rng));
+                self.heartbeat_timeout = None;
+            }
+            RoleState::Candidate => {
+                self.election_timeout = Some(current_time + gen_election_timeout(&mut self.rng));
+                self.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut self.rng));
+            }
+            RoleState::Leader => {
+                self.election_timeout = None;
+                self.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut self.rng));
+            }
+        }
+    }
+}
+
 const ELECTION_TIMEOUT_MIN: u64 = 300;
 const ELECTION_TIMEOUT_MAX: u64 = 600;
 const HEARTBEAT_TIMEOUT: u64 = 100;
@@ -302,11 +334,6 @@ impl Raft {
         }
     }
 
-    fn reset_heartbeat_timeout(&mut self, timing: &mut Timing) {
-        let current_time = time::Instant::now();
-        timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
-    }
-
     fn request_vote(&mut self, sender: &mpsc::UnboundedSender<Command>) {
         for id in &self.votes_not_respond {
             self.send_request_vote(
@@ -351,9 +378,7 @@ impl Raft {
             }
         }
         //update timers
-        let current_time = time::Instant::now();
-        timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
-        timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
+        timing.reset_when_becomes(RoleState::Candidate);
         //send vote request
         self.request_vote(&sender);
     }
@@ -367,12 +392,9 @@ impl Raft {
             self.leader_id = None;
             self.voted_for = None;
             //reset timing
-            let current_time = time::Instant::now();
-            timing.heartbeat_timeout = None;
-            timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
-        } else if timing.election_timeout.is_some() {
-            let current_time = time::Instant::now();
-            timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
+            timing.reset_when_becomes(RoleState::Follower)
+        } else {
+            timing.reset_election_timeout()
         }
     }
 
@@ -381,9 +403,7 @@ impl Raft {
         // set leader
         self.leader_id = Some(self.me as u64);
         // reset timer
-        let current_time = time::Instant::now();
-        timing.election_timeout = None;
-        timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
+        timing.reset_when_becomes(RoleState::Leader);
         // send heartbeat
         self.append_entries(sender)
     }
@@ -472,13 +492,14 @@ impl Raft {
                 self.start_election(timing, &sender)
             }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Heartbeat)) => {
-                self.reset_heartbeat_timeout(timing);
+                timing.reset_heartbeat_timeout();
                 self.request_vote(sender)
             }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => {
                 self.start_election(timing, sender)
             }
             (RoleState::Leader, Task::Timeout(TimeoutType::Heartbeat)) => {
+                timing.reset_heartbeat_timeout();
                 self.append_entries(sender)
             }
             (RoleState::Leader, Task::Timeout(TimeoutType::Election)) => {
