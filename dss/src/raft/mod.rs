@@ -359,6 +359,58 @@ impl Raft {
             is_leader: self.role_state() == RoleState::Leader,
         }
     }
+
+    fn peers_count(&self) -> u64 {
+        self.peers.len() as u64
+    }
+
+    fn reset(&mut self, role_state: RoleState) {
+        match role_state {
+            RoleState::Follower => {
+                self.leader_id = None;
+                self.voted_for = None;
+            }
+            RoleState::Candidate => {
+                self.leader_id = None;
+                self.voted_for = Some(self.me as u64);
+                self.votes_granted.clear();
+                self.votes_granted.insert(self.me as u64);
+                self.votes_not_respond.clear();
+                for id in 0..self.peers_count() {
+                    if id != self.me as u64 {
+                        self.votes_not_respond.insert(id as u64);
+                    }
+                }
+            }
+            RoleState::Leader => {
+                self.leader_id = Some(self.me as u64);
+            }
+        }
+    }
+
+    fn update_vote(&mut self, peer: u64, granted: bool) {
+        self.votes_not_respond.remove(&peer);
+        if granted {
+            self.votes_granted.insert(peer);
+        }
+    }
+
+    fn vote(&mut self, id: u64, term: u64) -> bool {
+        let vote = if let Some(voted_id) = self.voted_for {
+            id == voted_id
+        } else {
+            // TODO: log related vote
+            self.current_term <= term
+        };
+        if self.voted_for.is_none() && vote {
+            info!("Raft #{:?}: Vote for {:?}", self.me, id);
+            self.voted_for = Some(id)
+        }
+        vote
+    }
+    fn check_vote(&self) -> bool {
+        self.votes_granted.len() as u64 * 2 > self.peers_count()
+    }
 }
 
 struct RaftStore {
@@ -372,12 +424,21 @@ impl RaftStore {
     fn me(&self) -> u64 {
         self.raft.me as u64
     }
+    fn term(&self) -> u64 {
+        self.raft.current_term
+    }
+    fn set_term(&mut self, term: u64) {
+        self.raft.current_term = term
+    }
+    fn role_state(&self) -> RoleState {
+        self.raft.role_state()
+    }
     fn request_vote(&mut self) {
         for id in &self.raft.votes_not_respond {
             self.raft.send_request_vote(
                 *id as usize,
                 &RequestVoteArgs {
-                    term: self.raft.current_term,
+                    term: self.term(),
                     candidate_id: self.me(),
                 },
                 &self.sender,
@@ -386,12 +447,12 @@ impl RaftStore {
     }
 
     fn append_entries(&mut self) {
-        for id in 0..self.raft.peers.len() {
-            if (id as u64) != self.me() {
+        for id in 0..self.raft.peers_count() {
+            if id != self.me() {
                 self.raft.send_append_entries(
-                    id,
+                    id as usize,
                     &AppendEntriesArgs {
-                        term: self.raft.current_term,
+                        term: self.term(),
                         leader_id: self.me(),
                     },
                     &self.sender,
@@ -403,18 +464,9 @@ impl RaftStore {
     fn start_election(&mut self) {
         info!("Raft #{:?}: Start election, becomes candidate", self.me());
         //go to a higher term
-        self.raft.current_term += 1;
+        self.set_term(self.term() + 1);
         //init vote states
-        self.raft.leader_id = None;
-        self.raft.voted_for = Some(self.me());
-        self.raft.votes_granted.clear();
-        self.raft.votes_granted.insert(self.me());
-        self.raft.votes_not_respond.clear();
-        for id in 0..self.raft.peers.len() {
-            if (id as u64) != self.me() {
-                self.raft.votes_not_respond.insert(id as u64);
-            }
-        }
+        self.raft.reset(RoleState::Candidate);
         //update timers
         self.timing.reset_when_becomes(RoleState::Candidate);
         //send vote request
@@ -422,13 +474,12 @@ impl RaftStore {
     }
 
     fn generic_request_handler(&mut self, term: u64) {
-        if term > self.raft.current_term {
+        if term > self.term() {
             info!("Raft #{:?}: Found higher term, becomes follower", self.me());
             //update term
-            self.raft.current_term = term;
+            self.set_term(term);
             //convert to follower
-            self.raft.leader_id = None;
-            self.raft.voted_for = None;
+            self.raft.reset(RoleState::Follower);
             //reset timing
             self.timing.reset_when_becomes(RoleState::Follower)
         } else {
@@ -439,7 +490,7 @@ impl RaftStore {
     fn becomes_leader(&mut self) {
         info!("Raft #{:?}: Vote granted, becomes leader", self.me());
         // set leader
-        self.raft.leader_id = Some(self.me());
+        self.raft.reset(RoleState::Leader);
         // reset timer
         self.timing.reset_when_becomes(RoleState::Leader);
         // send heartbeat
@@ -452,21 +503,10 @@ impl RaftStore {
         sender: oneshot::Sender<RequestVoteReply>,
     ) {
         self.generic_request_handler(args.term);
-        // TODO: log related vote
-        let vote = if self.raft.current_term > args.term {
-            false
-        } else if let Some(id) = self.raft.voted_for {
-            id == args.candidate_id
-        } else {
-            true
-        };
-        if self.raft.voted_for.is_none() && vote {
-            info!("Raft #{:?}: Vote for {:?}", self.me(), args.candidate_id);
-            self.raft.voted_for = Some(args.candidate_id)
-        }
+        let vote = self.raft.vote(args.candidate_id, args.term);
         sender
             .send(RequestVoteReply {
-                term: self.raft.current_term,
+                term: self.term(),
                 vote_granted: vote,
             })
             .unwrap_or_default();
@@ -479,20 +519,15 @@ impl RaftStore {
     ) {
         self.generic_request_handler(args.term);
         sender
-            .send(AppendEntriesReply {
-                term: self.raft.current_term,
-            })
+            .send(AppendEntriesReply { term: self.term() })
             .unwrap_or_default();
     }
 
     fn process_vote(&mut self, id: u64, reply: RequestVoteReply) {
         self.generic_request_handler(reply.term);
-        if self.raft.role_state() == RoleState::Candidate {
-            self.raft.votes_not_respond.remove(&id);
-            if reply.vote_granted {
-                self.raft.votes_granted.insert(id);
-            }
-            if self.raft.votes_granted.len() * 2 > self.raft.peers.len() {
+        if self.role_state() == RoleState::Candidate {
+            self.raft.update_vote(id, reply.vote_granted);
+            if self.raft.check_vote() {
                 self.becomes_leader()
             }
         }
@@ -503,7 +538,7 @@ impl RaftStore {
     }
 
     fn process_task(&mut self, task: Task) {
-        match (self.raft.role_state(), task) {
+        match (self.role_state(), task) {
             (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
                 panic!("Follower should not has heartbeat timeout")
             }
@@ -656,7 +691,7 @@ fn raft_thread(
         timing: Timing::new(),
     };
     let mut receiver_future = receiver.into_future();
-    info!("Raft #{:?}: Node created", raft_store.raft.me);
+    info!("Raft #{:?}: Node created", raft_store.me());
     loop {
         // select next timeout
         let (timeout_instant, timeout_type) = raft_store.timing.next_timeout();
@@ -670,19 +705,19 @@ fn raft_thread(
             }
             Ok(Either::A(((Some(Command::Kill), stream), _))) => {
                 // node explicitly killed
-                info!("Raft #{:?}: Node destroyed", raft_store.raft.me);
+                info!("Raft #{:?}: Node destroyed", raft_store.me());
                 return;
             }
             Ok(Either::A(((None, stream), _))) => {
                 // no more incoming message to execute, the sender is dropped and the node is destroyed
-                info!("Raft #{:?}: Node destroyed", raft_store.raft.me);
+                info!("Raft #{:?}: Node destroyed", raft_store.me());
                 return;
             }
             Err(Either::A(((error, stream), _))) => panic!("My channel gives me an error!"),
             Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
             Err(Either::B((error, stream_future))) => panic!("My timer gives me an error!"),
         };
-        debug!("Raft #{:?}: Get task {:?}", raft_store.raft.me, task);
+        debug!("Raft #{:?}: Get task {:?}", raft_store.me(), task);
         receiver_future = new_receiver_future;
 
         // process message/timeout
