@@ -140,6 +140,20 @@ impl Timing {
             }
         }
     }
+    fn next_timeout(&mut self) -> (time::Instant, TimeoutType) {
+        match (self.heartbeat_timeout, self.election_timeout) {
+            (Some(heartbeat), Some(election)) => {
+                if election > heartbeat {
+                    (heartbeat, TimeoutType::Heartbeat)
+                } else {
+                    (election, TimeoutType::Election)
+                }
+            }
+            (None, Some(election)) => (election, TimeoutType::Election),
+            (Some(heartbeat), None) => (heartbeat, TimeoutType::Heartbeat),
+            (None, None) => panic!("I have nothing to wait for"),
+        }
+    }
 }
 
 const ELECTION_TIMEOUT_MIN: u64 = 300;
@@ -345,103 +359,114 @@ impl Raft {
             is_leader: self.role_state() == RoleState::Leader,
         }
     }
+}
 
-    fn request_vote(&mut self, sender: &mpsc::UnboundedSender<Command>) {
-        for id in &self.votes_not_respond {
-            self.send_request_vote(
+struct RaftStore {
+    raft: Raft,
+    state: Arc<Mutex<State>>,
+    sender: mpsc::UnboundedSender<Command>,
+    timing: Timing,
+}
+
+impl RaftStore {
+    fn me(&self) -> u64 {
+        self.raft.me as u64
+    }
+    fn request_vote(&mut self) {
+        for id in &self.raft.votes_not_respond {
+            self.raft.send_request_vote(
                 *id as usize,
                 &RequestVoteArgs {
-                    term: self.current_term,
-                    candidate_id: self.me as u64,
+                    term: self.raft.current_term,
+                    candidate_id: self.me(),
                 },
-                sender,
+                &self.sender,
             )
         }
     }
 
-    fn append_entries(&mut self, sender: &mpsc::UnboundedSender<Command>) {
-        for id in 0..self.peers.len() {
-            if id != self.me {
-                self.send_append_entries(
+    fn append_entries(&mut self) {
+        for id in 0..self.raft.peers.len() {
+            if (id as u64) != self.me() {
+                self.raft.send_append_entries(
                     id,
                     &AppendEntriesArgs {
-                        term: self.current_term,
-                        leader_id: self.me as u64,
+                        term: self.raft.current_term,
+                        leader_id: self.me(),
                     },
-                    sender,
+                    &self.sender,
                 )
             }
         }
     }
 
-    fn start_election(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Command>) {
-        info!("Raft #{:?}: Start election, becomes candidate", self.me);
+    fn start_election(&mut self) {
+        info!("Raft #{:?}: Start election, becomes candidate", self.me());
         //go to a higher term
-        self.current_term += 1;
+        self.raft.current_term += 1;
         //init vote states
-        self.leader_id = None;
-        self.voted_for = Some(self.me as u64);
-        self.votes_granted.clear();
-        self.votes_granted.insert(self.me as u64);
-        self.votes_not_respond.clear();
-        for id in 0..self.peers.len() {
-            if id != self.me {
-                self.votes_not_respond.insert(id as u64);
+        self.raft.leader_id = None;
+        self.raft.voted_for = Some(self.me());
+        self.raft.votes_granted.clear();
+        self.raft.votes_granted.insert(self.me());
+        self.raft.votes_not_respond.clear();
+        for id in 0..self.raft.peers.len() {
+            if (id as u64) != self.me() {
+                self.raft.votes_not_respond.insert(id as u64);
             }
         }
         //update timers
-        timing.reset_when_becomes(RoleState::Candidate);
+        self.timing.reset_when_becomes(RoleState::Candidate);
         //send vote request
-        self.request_vote(&sender);
+        self.request_vote();
     }
 
-    fn generic_request_handler(&mut self, term: u64, timing: &mut Timing) {
-        if term > self.current_term {
-            info!("Raft #{:?}: Found higher term, becomes follower", self.me);
+    fn generic_request_handler(&mut self, term: u64) {
+        if term > self.raft.current_term {
+            info!("Raft #{:?}: Found higher term, becomes follower", self.me());
             //update term
-            self.current_term = term;
+            self.raft.current_term = term;
             //convert to follower
-            self.leader_id = None;
-            self.voted_for = None;
+            self.raft.leader_id = None;
+            self.raft.voted_for = None;
             //reset timing
-            timing.reset_when_becomes(RoleState::Follower)
+            self.timing.reset_when_becomes(RoleState::Follower)
         } else {
-            timing.reset_election_timeout()
+            self.timing.reset_election_timeout()
         }
     }
 
-    fn becomes_leader(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Command>) {
-        info!("Raft #{:?}: Vote granted, becomes leader", self.me);
+    fn becomes_leader(&mut self) {
+        info!("Raft #{:?}: Vote granted, becomes leader", self.me());
         // set leader
-        self.leader_id = Some(self.me as u64);
+        self.raft.leader_id = Some(self.me());
         // reset timer
-        timing.reset_when_becomes(RoleState::Leader);
+        self.timing.reset_when_becomes(RoleState::Leader);
         // send heartbeat
-        self.append_entries(sender)
+        self.append_entries()
     }
 
     fn process_request_vote(
         &mut self,
         args: RequestVoteArgs,
         sender: oneshot::Sender<RequestVoteReply>,
-        timing: &mut Timing,
     ) {
-        self.generic_request_handler(args.term, timing);
+        self.generic_request_handler(args.term);
         // TODO: log related vote
-        let vote = if self.current_term > args.term {
+        let vote = if self.raft.current_term > args.term {
             false
-        } else if let Some(id) = self.voted_for {
+        } else if let Some(id) = self.raft.voted_for {
             id == args.candidate_id
         } else {
             true
         };
-        if self.voted_for.is_none() && vote {
-            info!("Raft #{:?}: Vote for {:?}", self.me, args.candidate_id);
-            self.voted_for = Some(args.candidate_id)
+        if self.raft.voted_for.is_none() && vote {
+            info!("Raft #{:?}: Vote for {:?}", self.me(), args.candidate_id);
+            self.raft.voted_for = Some(args.candidate_id)
         }
         sender
             .send(RequestVoteReply {
-                term: self.current_term,
+                term: self.raft.current_term,
                 vote_granted: vote,
             })
             .unwrap_or_default();
@@ -451,93 +476,63 @@ impl Raft {
         &mut self,
         args: AppendEntriesArgs,
         sender: oneshot::Sender<AppendEntriesReply>,
-        timing: &mut Timing,
     ) {
-        self.generic_request_handler(args.term, timing);
+        self.generic_request_handler(args.term);
         sender
             .send(AppendEntriesReply {
-                term: self.current_term,
+                term: self.raft.current_term,
             })
             .unwrap_or_default();
     }
 
-    fn process_vote(
-        &mut self,
-        id: u64,
-        reply: RequestVoteReply,
-        timing: &mut Timing,
-        sender: &mpsc::UnboundedSender<Command>,
-    ) {
-        self.generic_request_handler(reply.term, timing);
-        if self.role_state() == RoleState::Candidate {
-            self.votes_not_respond.remove(&id);
+    fn process_vote(&mut self, id: u64, reply: RequestVoteReply) {
+        self.generic_request_handler(reply.term);
+        if self.raft.role_state() == RoleState::Candidate {
+            self.raft.votes_not_respond.remove(&id);
             if reply.vote_granted {
-                self.votes_granted.insert(id);
+                self.raft.votes_granted.insert(id);
             }
-            if self.votes_granted.len() * 2 > self.peers.len() {
-                self.becomes_leader(timing, &sender)
+            if self.raft.votes_granted.len() * 2 > self.raft.peers.len() {
+                self.becomes_leader()
             }
         }
     }
 
-    fn process_feedback(
-        &mut self,
-        id: u64,
-        reply: AppendEntriesReply,
-        timing: &mut Timing,
-        sender: &mpsc::UnboundedSender<Command>,
-    ) {
-        self.generic_request_handler(reply.term, timing);
+    fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply) {
+        self.generic_request_handler(reply.term);
     }
 
-    fn process_task(
-        &mut self,
-        task: Task,
-        timing: &mut Timing,
-        sender: &mpsc::UnboundedSender<Command>,
-    ) {
-        match (self.role_state(), task) {
+    fn process_task(&mut self, task: Task) {
+        match (self.raft.role_state(), task) {
             (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
                 panic!("Follower should not has heartbeat timeout")
             }
-            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => {
-                self.start_election(timing, &sender)
-            }
+            (RoleState::Follower, Task::Timeout(TimeoutType::Election)) => self.start_election(),
             (RoleState::Candidate, Task::Timeout(TimeoutType::Heartbeat)) => {
-                timing.reset_heartbeat_timeout();
-                self.request_vote(sender)
+                self.timing.reset_heartbeat_timeout();
+                self.request_vote()
             }
-            (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => {
-                self.start_election(timing, sender)
-            }
+            (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => self.start_election(),
             (RoleState::Leader, Task::Timeout(TimeoutType::Heartbeat)) => {
-                timing.reset_heartbeat_timeout();
-                self.append_entries(sender)
+                self.timing.reset_heartbeat_timeout();
+                self.append_entries()
             }
             (RoleState::Leader, Task::Timeout(TimeoutType::Election)) => {
                 panic!("Leader should not has heartbeat timeout")
             }
             (_, Task::Packet(Incoming::RequestVote(arg, sender))) => {
-                self.process_request_vote(arg, sender, timing)
+                self.process_request_vote(arg, sender)
             }
             (_, Task::Packet(Incoming::AppendEntries(arg, sender))) => {
-                self.process_append_entries(arg, sender, timing)
+                self.process_append_entries(arg, sender)
             }
-            (_, Task::Packet(Incoming::Vote(id, reply))) => {
-                self.process_vote(id, reply, timing, sender)
-            }
-            (_, Task::Packet(Incoming::Feedback(id, reply))) => {
-                self.process_feedback(id, reply, timing, sender)
-            }
+            (_, Task::Packet(Incoming::Vote(id, reply))) => self.process_vote(id, reply),
+            (_, Task::Packet(Incoming::Feedback(id, reply))) => self.process_feedback(id, reply),
         }
     }
-}
-
-struct RaftStore {
-    raft: Raft,
-    state: Arc<Mutex<State>>,
-    sender: mpsc::UnboundedSender<Command>,
-    timing: Timing,
+    fn update_state(&mut self) {
+        *self.state.lock().unwrap() = self.raft.state();
+    }
 }
 
 // Choose concurrency paradigm.
@@ -654,24 +649,17 @@ fn raft_thread(
     receiver: mpsc::UnboundedReceiver<Command>,
     sender: mpsc::UnboundedSender<Command>,
 ) {
-    let mut raft = raft;
-    let mut timing = Timing::new();
+    let mut raft_store = RaftStore {
+        raft,
+        state,
+        sender,
+        timing: Timing::new(),
+    };
     let mut receiver_future = receiver.into_future();
+    info!("Raft #{:?}: Node created", raft_store.raft.me);
     loop {
         // select next timeout
-        let (timeout_instant, timeout_type) =
-            match (timing.heartbeat_timeout, timing.election_timeout) {
-                (Some(heartbeat), Some(election)) => {
-                    if election > heartbeat {
-                        (heartbeat, TimeoutType::Heartbeat)
-                    } else {
-                        (election, TimeoutType::Election)
-                    }
-                }
-                (None, Some(election)) => (election, TimeoutType::Election),
-                (Some(heartbeat), None) => (heartbeat, TimeoutType::Heartbeat),
-                (None, None) => panic!("I have nothing to wait for"),
-            };
+        let (timeout_instant, timeout_type) = raft_store.timing.next_timeout();
         let timeout = Delay::new_at(timeout_instant);
 
         // wait for message+timer
@@ -682,25 +670,25 @@ fn raft_thread(
             }
             Ok(Either::A(((Some(Command::Kill), stream), _))) => {
                 // node explicitly killed
-                info!("Raft #{:?}: Node destroyed", raft.me);
+                info!("Raft #{:?}: Node destroyed", raft_store.raft.me);
                 return;
             }
             Ok(Either::A(((None, stream), _))) => {
                 // no more incoming message to execute, the sender is dropped and the node is destroyed
-                info!("Raft #{:?}: Node destroyed", raft.me);
+                info!("Raft #{:?}: Node destroyed", raft_store.raft.me);
                 return;
             }
             Err(Either::A(((error, stream), _))) => panic!("My channel gives me an error!"),
             Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
             Err(Either::B((error, stream_future))) => panic!("My timer gives me an error!"),
         };
-        debug!("Raft #{:?}: Get task {:?}", raft.me, task);
+        debug!("Raft #{:?}: Get task {:?}", raft_store.raft.me, task);
         receiver_future = new_receiver_future;
 
         // process message/timeout
-        raft.process_task(task, &mut timing, &sender);
+        raft_store.process_task(task);
 
         //update state
-        *state.lock().unwrap() = raft.state();
+        raft_store.update_state()
     }
 }
