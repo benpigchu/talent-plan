@@ -65,6 +65,13 @@ enum Incoming {
     Feedback(u64, AppendEntriesReply),
 }
 
+///Message to the raft thread
+#[derive(Debug)]
+enum Command {
+    Inbound(Incoming),
+    Kill,
+}
+
 /// type of timer timeout
 #[derive(Debug)]
 enum TimeoutType {
@@ -223,21 +230,23 @@ impl Raft {
         &self,
         server: usize,
         args: &RequestVoteArgs,
-        sender: &mpsc::UnboundedSender<Incoming>,
+        sender: &mpsc::UnboundedSender<Command>,
     ) {
         let peer = &self.peers[server];
         // Your code here if you want the rpc becomes async.
         // Example:
         // ```
         // let (tx, rx) = channel();
+
+        debug!("Raft #{:?}: Send request vote {:?}", self.me, args);
         let sender_clone = sender.clone();
         peer.spawn(
             peer.request_vote(&args)
                 .map_err(|err| ())
                 .and_then(move |res| {
                     sender_clone
-                        .unbounded_send(Incoming::Vote(server as u64, res))
-                        .unwrap();
+                        .unbounded_send(Command::Inbound(Incoming::Vote(server as u64, res)))
+                        .unwrap_or_default();
                     Ok(())
                 }),
         );
@@ -247,21 +256,22 @@ impl Raft {
         &self,
         server: usize,
         args: &AppendEntriesArgs,
-        sender: &mpsc::UnboundedSender<Incoming>,
+        sender: &mpsc::UnboundedSender<Command>,
     ) {
         let peer = &self.peers[server];
         // Your code here if you want the rpc becomes async.
         // Example:
         // ```
         // let (tx, rx) = channel();
+        debug!("Raft #{:?}: Send append entries {:?}", self.me, args);
         let sender_clone = sender.clone();
         peer.spawn(
             peer.append_entries(&args)
                 .map_err(|err| ())
                 .and_then(move |res| {
                     sender_clone
-                        .unbounded_send(Incoming::Feedback(server as u64, res))
-                        .unwrap();
+                        .unbounded_send(Command::Inbound(Incoming::Feedback(server as u64, res)))
+                        .unwrap_or_default();
                     Ok(())
                 }),
         );
@@ -297,7 +307,7 @@ impl Raft {
         timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
     }
 
-    fn request_vote(&mut self, sender: &mpsc::UnboundedSender<Incoming>) {
+    fn request_vote(&mut self, sender: &mpsc::UnboundedSender<Command>) {
         for id in &self.votes_not_respond {
             self.send_request_vote(
                 *id as usize,
@@ -310,20 +320,22 @@ impl Raft {
         }
     }
 
-    fn append_entries(&mut self, sender: &mpsc::UnboundedSender<Incoming>) {
+    fn append_entries(&mut self, sender: &mpsc::UnboundedSender<Command>) {
         for id in 0..self.peers.len() {
-            self.send_append_entries(
-                id,
-                &AppendEntriesArgs {
-                    term: self.current_term,
-                    leader_id: self.me as u64,
-                },
-                sender,
-            )
+            if id != self.me {
+                self.send_append_entries(
+                    id,
+                    &AppendEntriesArgs {
+                        term: self.current_term,
+                        leader_id: self.me as u64,
+                    },
+                    sender,
+                )
+            }
         }
     }
 
-    fn start_election(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
+    fn start_election(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Command>) {
         info!("Raft #{:?}: Start election, becomes candidate", self.me);
         //go to a higher term
         self.current_term += 1;
@@ -364,7 +376,7 @@ impl Raft {
         }
     }
 
-    fn becomes_leader(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
+    fn becomes_leader(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Command>) {
         info!("Raft #{:?}: Vote granted, becomes leader", self.me);
         // set leader
         self.leader_id = Some(self.me as u64);
@@ -391,7 +403,8 @@ impl Raft {
         } else {
             true
         };
-        if vote {
+        if self.voted_for.is_none() && vote {
+            info!("Raft #{:?}: Vote for {:?}", self.me, args.candidate_id);
             self.voted_for = Some(args.candidate_id)
         }
         sender
@@ -421,7 +434,7 @@ impl Raft {
         id: u64,
         reply: RequestVoteReply,
         timing: &mut Timing,
-        sender: &mpsc::UnboundedSender<Incoming>,
+        sender: &mpsc::UnboundedSender<Command>,
     ) {
         self.generic_request_handler(reply.term, timing);
         if self.role_state() == RoleState::Candidate {
@@ -440,7 +453,7 @@ impl Raft {
         id: u64,
         reply: AppendEntriesReply,
         timing: &mut Timing,
-        sender: &mpsc::UnboundedSender<Incoming>,
+        sender: &mpsc::UnboundedSender<Command>,
     ) {
         self.generic_request_handler(reply.term, timing);
     }
@@ -449,7 +462,7 @@ impl Raft {
         &mut self,
         task: Task,
         timing: &mut Timing,
-        sender: &mpsc::UnboundedSender<Incoming>,
+        sender: &mpsc::UnboundedSender<Command>,
     ) {
         match (self.role_state(), task) {
             (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
@@ -504,7 +517,7 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
-    sender: mpsc::UnboundedSender<Incoming>,
+    sender: mpsc::UnboundedSender<Command>,
     state: Arc<Mutex<State>>,
 }
 
@@ -512,7 +525,7 @@ impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        let (sender, receiver) = mpsc::unbounded::<Incoming>();
+        let (sender, receiver) = mpsc::unbounded::<Command>();
         let sender_clone = sender.clone();
         let state = Arc::new(Mutex::new(State {
             term: 0,
@@ -573,6 +586,9 @@ impl Node {
     /// turn off debug output from this instance.
     pub fn kill(&self) {
         // Your code here, if desired.
+        self.sender
+            .unbounded_send(Command::Kill)
+            .unwrap_or_default();
     }
 }
 
@@ -582,7 +598,7 @@ impl RaftService for Node {
         // Your code here (2A, 2B).
         let (sender, receiver) = oneshot::channel::<RequestVoteReply>();
         self.sender
-            .unbounded_send(Incoming::RequestVote(args, sender))
+            .unbounded_send(Command::Inbound(Incoming::RequestVote(args, sender)))
             .unwrap_or_default();
         Box::new(receiver.map_err(labrpc::Error::Recv))
     }
@@ -590,7 +606,7 @@ impl RaftService for Node {
         // Your code here (2A, 2B).
         let (sender, receiver) = oneshot::channel::<AppendEntriesReply>();
         self.sender
-            .unbounded_send(Incoming::AppendEntries(args, sender))
+            .unbounded_send(Command::Inbound(Incoming::AppendEntries(args, sender)))
             .unwrap_or_default();
         Box::new(receiver.map_err(labrpc::Error::Recv))
     }
@@ -599,8 +615,8 @@ impl RaftService for Node {
 fn raft_thread(
     raft: Raft,
     state: Arc<Mutex<State>>,
-    receiver: mpsc::UnboundedReceiver<Incoming>,
-    sender: mpsc::UnboundedSender<Incoming>,
+    receiver: mpsc::UnboundedReceiver<Command>,
+    sender: mpsc::UnboundedSender<Command>,
 ) {
     let mut raft = raft;
     let mut rng = rand::thread_rng();
@@ -632,14 +648,18 @@ fn raft_thread(
         // wait for message+timer
         let wait_result = receiver_future.select2(timeout).wait();
         let (task, new_receiver_future) = match wait_result {
-            Ok(Either::A(((message, stream), _))) => {
-                if let Some(incoming) = message {
-                    (Task::Packet(incoming), stream.into_future())
-                } else {
-                    // no more incoming message to execute, the sender is dropped and the node is destroyed
-                    info!("Raft #{:?}: Node destroyed", raft.me);
-                    return;
-                }
+            Ok(Either::A(((Some(Command::Inbound(message)), stream), _))) => {
+                (Task::Packet(message), stream.into_future())
+            }
+            Ok(Either::A(((Some(Command::Kill), stream), _))) => {
+                // node explicitly killed
+                info!("Raft #{:?}: Node destroyed", raft.me);
+                return;
+            }
+            Ok(Either::A(((None, stream), _))) => {
+                // no more incoming message to execute, the sender is dropped and the node is destroyed
+                info!("Raft #{:?}: Node destroyed", raft.me);
+                return;
             }
             Err(Either::A(((error, stream), _))) => panic!("My channel gives me an error!"),
             Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
