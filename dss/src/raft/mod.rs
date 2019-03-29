@@ -243,6 +243,30 @@ impl Raft {
         );
     }
 
+    fn send_append_entries(
+        &self,
+        server: usize,
+        args: &AppendEntriesArgs,
+        sender: &mpsc::UnboundedSender<Incoming>,
+    ) {
+        let peer = &self.peers[server];
+        // Your code here if you want the rpc becomes async.
+        // Example:
+        // ```
+        // let (tx, rx) = channel();
+        let sender_clone = sender.clone();
+        peer.spawn(
+            peer.append_entries(&args)
+                .map_err(|err| ())
+                .and_then(move |res| {
+                    sender_clone
+                        .unbounded_send(Incoming::Feedback(server as u64, res))
+                        .unwrap();
+                    Ok(())
+                }),
+        );
+    }
+
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
@@ -273,7 +297,7 @@ impl Raft {
         timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
     }
 
-    fn request_vote(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
+    fn request_vote(&mut self, sender: &mpsc::UnboundedSender<Incoming>) {
         for id in &self.votes_not_respond {
             self.send_request_vote(
                 *id as usize,
@@ -281,12 +305,26 @@ impl Raft {
                     term: self.current_term,
                     candidate_id: self.me as u64,
                 },
-                &sender,
+                sender,
+            )
+        }
+    }
+
+    fn append_entries(&mut self, sender: &mpsc::UnboundedSender<Incoming>) {
+        for id in 0..self.peers.len() {
+            self.send_append_entries(
+                id,
+                &AppendEntriesArgs {
+                    term: self.current_term,
+                    leader_id: self.me as u64,
+                },
+                sender,
             )
         }
     }
 
     fn start_election(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
+        info!("Raft #{:?}: Start election, becomes candidate", self.me);
         //go to a higher term
         self.current_term += 1;
         //init vote states
@@ -305,11 +343,12 @@ impl Raft {
         timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
         timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
         //send vote request
-        self.request_vote(timing, &sender);
+        self.request_vote(&sender);
     }
 
     fn generic_request_handler(&mut self, term: u64, timing: &mut Timing) {
         if term > self.current_term {
+            info!("Raft #{:?}: Found higher term, becomes follower", self.me);
             //update term
             self.current_term = term;
             //convert to follower
@@ -323,6 +362,18 @@ impl Raft {
             let current_time = time::Instant::now();
             timing.election_timeout = Some(current_time + gen_election_timeout(&mut timing.rng));
         }
+    }
+
+    fn becomes_leader(&mut self, timing: &mut Timing, sender: &mpsc::UnboundedSender<Incoming>) {
+        info!("Raft #{:?}: Vote granted, becomes leader", self.me);
+        // set leader
+        self.leader_id = Some(self.me as u64);
+        // reset timer
+        let current_time = time::Instant::now();
+        timing.election_timeout = None;
+        timing.heartbeat_timeout = Some(current_time + gen_heartbeat_timeout(&mut timing.rng));
+        // send heartbeat
+        self.append_entries(sender)
     }
 
     fn process_request_vote(
@@ -351,11 +402,27 @@ impl Raft {
             .unwrap_or_default();
     }
 
-    fn becomes_leader(&mut self) {
-        info!("Raft #{:?}: Becomes leader", self.me)
+    fn process_append_entries(
+        &mut self,
+        args: AppendEntriesArgs,
+        sender: oneshot::Sender<AppendEntriesReply>,
+        timing: &mut Timing,
+    ) {
+        self.generic_request_handler(args.term, timing);
+        sender
+            .send(AppendEntriesReply {
+                term: self.current_term,
+            })
+            .unwrap_or_default();
     }
 
-    fn process_vote(&mut self, id: u64, reply: RequestVoteReply, timing: &mut Timing) {
+    fn process_vote(
+        &mut self,
+        id: u64,
+        reply: RequestVoteReply,
+        timing: &mut Timing,
+        sender: &mpsc::UnboundedSender<Incoming>,
+    ) {
         self.generic_request_handler(reply.term, timing);
         if self.role_state() == RoleState::Candidate {
             self.votes_not_respond.remove(&id);
@@ -363,9 +430,19 @@ impl Raft {
                 self.votes_granted.insert(id);
             }
             if self.votes_granted.len() * 2 > self.peers.len() {
-                self.becomes_leader()
+                self.becomes_leader(timing, &sender)
             }
         }
+    }
+
+    fn process_feedback(
+        &mut self,
+        id: u64,
+        reply: AppendEntriesReply,
+        timing: &mut Timing,
+        sender: &mpsc::UnboundedSender<Incoming>,
+    ) {
+        self.generic_request_handler(reply.term, timing);
     }
 
     fn process_task(
@@ -383,21 +460,28 @@ impl Raft {
             }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Heartbeat)) => {
                 self.reset_heartbeat_timeout(timing);
-                self.request_vote(timing, &sender)
+                self.request_vote(sender)
             }
             (RoleState::Candidate, Task::Timeout(TimeoutType::Election)) => {
-                self.start_election(timing, &sender)
+                self.start_election(timing, sender)
             }
-            (RoleState::Leader, Task::Timeout(TimeoutType::Heartbeat)) => unimplemented!(),
+            (RoleState::Leader, Task::Timeout(TimeoutType::Heartbeat)) => {
+                self.append_entries(sender)
+            }
             (RoleState::Leader, Task::Timeout(TimeoutType::Election)) => {
                 panic!("Leader should not has heartbeat timeout")
             }
             (_, Task::Packet(Incoming::RequestVote(arg, sender))) => {
                 self.process_request_vote(arg, sender, timing)
             }
-            (_, Task::Packet(Incoming::Vote(id, reply))) => self.process_vote(id, reply, timing),
-            (_, _) => {
-                //discard other tasks
+            (_, Task::Packet(Incoming::AppendEntries(arg, sender))) => {
+                self.process_append_entries(arg, sender, timing)
+            }
+            (_, Task::Packet(Incoming::Vote(id, reply))) => {
+                self.process_vote(id, reply, timing, sender)
+            }
+            (_, Task::Packet(Incoming::Feedback(id, reply))) => {
+                self.process_feedback(id, reply, timing, sender)
             }
         }
     }
@@ -561,7 +645,7 @@ fn raft_thread(
             Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
             Err(Either::B((error, stream_future))) => panic!("My timer gives me an error!"),
         };
-        info!("Raft #{:?}: Get task {:?}", raft.me, task);
+        debug!("Raft #{:?}: Get task {:?}", raft.me, task);
         receiver_future = new_receiver_future;
 
         // process message/timeout
