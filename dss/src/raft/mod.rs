@@ -72,6 +72,12 @@ enum Command {
     Kill,
 }
 
+fn push_inbound(sender: &mpsc::UnboundedSender<Command>, incoming: Incoming) {
+    sender
+        .unbounded_send(Command::Inbound(incoming))
+        .unwrap_or_default();
+}
+
 /// type of timer timeout
 #[derive(Debug)]
 enum TimeoutType {
@@ -95,6 +101,16 @@ struct Timing {
 }
 
 impl Timing {
+    fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let start_time = time::Instant::now();
+        let init_election_timeout = gen_election_timeout(&mut rng);
+        Timing {
+            rng,
+            heartbeat_timeout: None,
+            election_timeout: Some(start_time + init_election_timeout),
+        }
+    }
     fn reset_heartbeat_timeout(&mut self) {
         if self.heartbeat_timeout.is_some() {
             let current_time = time::Instant::now();
@@ -276,9 +292,7 @@ impl Raft {
             peer.request_vote(&args)
                 .map_err(|err| ())
                 .and_then(move |res| {
-                    sender_clone
-                        .unbounded_send(Command::Inbound(Incoming::Vote(server as u64, res)))
-                        .unwrap_or_default();
+                    push_inbound(&sender_clone, Incoming::Vote(server as u64, res));
                     Ok(())
                 }),
         );
@@ -301,9 +315,7 @@ impl Raft {
             peer.append_entries(&args)
                 .map_err(|err| ())
                 .and_then(move |res| {
-                    sender_clone
-                        .unbounded_send(Command::Inbound(Incoming::Feedback(server as u64, res)))
-                        .unwrap_or_default();
+                    push_inbound(&sender_clone, Incoming::Feedback(server as u64, res));
                     Ok(())
                 }),
         );
@@ -521,6 +533,13 @@ impl Raft {
     }
 }
 
+struct RaftStore {
+    raft: Raft,
+    state: Arc<Mutex<State>>,
+    sender: mpsc::UnboundedSender<Command>,
+    timing: Timing,
+}
+
 // Choose concurrency paradigm.
 //
 // You can either drive the raft state machine by the rpc framework,
@@ -618,17 +637,13 @@ impl RaftService for Node {
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
         let (sender, receiver) = oneshot::channel::<RequestVoteReply>();
-        self.sender
-            .unbounded_send(Command::Inbound(Incoming::RequestVote(args, sender)))
-            .unwrap_or_default();
+        push_inbound(&self.sender, Incoming::RequestVote(args, sender));
         Box::new(receiver.map_err(labrpc::Error::Recv))
     }
     fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
         // Your code here (2A, 2B).
         let (sender, receiver) = oneshot::channel::<AppendEntriesReply>();
-        self.sender
-            .unbounded_send(Command::Inbound(Incoming::AppendEntries(args, sender)))
-            .unwrap_or_default();
+        push_inbound(&self.sender, Incoming::AppendEntries(args, sender));
         Box::new(receiver.map_err(labrpc::Error::Recv))
     }
 }
@@ -640,14 +655,7 @@ fn raft_thread(
     sender: mpsc::UnboundedSender<Command>,
 ) {
     let mut raft = raft;
-    let mut rng = rand::thread_rng();
-    let start_time = time::Instant::now();
-    let init_election_timeout = gen_election_timeout(&mut rng);
-    let mut timing = Timing {
-        rng,
-        heartbeat_timeout: None,
-        election_timeout: Some(start_time + init_election_timeout),
-    };
+    let mut timing = Timing::new();
     let mut receiver_future = receiver.into_future();
     loop {
         // select next timeout
