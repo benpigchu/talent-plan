@@ -473,8 +473,13 @@ impl Raft {
     fn check_entries_valid(&self, term: u64, prev_log_index: u64, prev_log_term: u64) -> bool {
         if term < self.current_term {
             false
+        } else if prev_log_index < 1 {
+            true
         } else {
-            let term = self.log.get(prev_log_index as usize).map(|log| log.term);
+            let term = self
+                .log
+                .get(prev_log_index as usize - 1)
+                .map(|log| log.term);
             term == Some(prev_log_term)
         }
     }
@@ -617,6 +622,12 @@ impl RaftStore {
             self.raft
                 .check_entries_valid(args.term, args.prev_log_index, args.prev_log_term);
         if success {
+            info!(
+                "Raft #{:?}: Apply {:?} entries begin at {:?}",
+                self.me(),
+                args.entries.len(),
+                args.prev_log_index
+            );
             self.raft
                 .apply_log(args.prev_log_index, args.entries, args.leader_commit)
         }
