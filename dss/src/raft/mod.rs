@@ -48,6 +48,12 @@ impl State {
     }
 }
 
+#[derive(Clone, Debug)]
+struct DetailedState {
+    state: State,
+    expected_log_length: u64,
+}
+
 /// The current role of the node
 #[derive(PartialEq, Debug)]
 enum RoleState {
@@ -168,6 +174,11 @@ fn gen_heartbeat_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(HEARTBEAT_TIMEOUT)
 }
 
+struct Log {
+    term: u64,
+    command: Vec<u8>,
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -181,6 +192,10 @@ pub struct Raft {
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     current_term: u64,
+    log: Vec<Log>,
+
+    commit_index: u64,
+    last_applied: u64,
 
     // if leader is self, we are leader
     leader_id: Option<u64>,
@@ -192,6 +207,8 @@ pub struct Raft {
     votes_granted: HashSet<u64>,
     votes_not_respond: HashSet<u64>,
     // special states for leader
+    next_index: Vec<u64>,
+    match_index: Vec<u64>,
 }
 
 impl Raft {
@@ -210,7 +227,7 @@ impl Raft {
         apply_ch: mpsc::UnboundedSender<ApplyMsg>,
     ) -> Raft {
         let raft_state = persister.raft_state();
-
+        let peers_count = peers.len();
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
             peers,
@@ -218,10 +235,15 @@ impl Raft {
             me,
             // state: Arc::default(),
             current_term: 0,
+            log: Vec::new(),
+            commit_index: 0,
+            last_applied: 0,
             voted_for: None,
             leader_id: None,
             votes_granted: HashSet::new(),
             votes_not_respond: HashSet::new(),
+            next_index: vec![0; peers_count],
+            match_index: vec![0; peers_count],
         };
 
         // initialize from state persisted before a crash
@@ -335,24 +357,6 @@ impl Raft {
         );
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
-    where
-        M: labcodec::Message,
-    {
-        let index = 0;
-        let term = 0;
-        let is_leader = true;
-        let mut buf = vec![];
-        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
-        // Your code here (2B).
-
-        if is_leader {
-            Ok((index, term))
-        } else {
-            Err(Error::NotLeader)
-        }
-    }
-
     fn state(&self) -> State {
         State {
             term: self.current_term,
@@ -362,6 +366,10 @@ impl Raft {
 
     fn peers_count(&self) -> u64 {
         self.peers.len() as u64
+    }
+
+    fn log_length(&self) -> u64 {
+        self.log.len() as u64
     }
 
     fn reset(&mut self, role_state: RoleState) {
@@ -408,6 +416,7 @@ impl Raft {
         }
         vote
     }
+
     fn check_vote(&self) -> bool {
         self.votes_granted.len() as u64 * 2 > self.peers_count()
     }
@@ -415,7 +424,7 @@ impl Raft {
 
 struct RaftStore {
     raft: Raft,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<DetailedState>>,
     sender: mpsc::UnboundedSender<Command>,
     timing: Timing,
 }
@@ -566,7 +575,11 @@ impl RaftStore {
         }
     }
     fn update_state(&mut self) {
-        *self.state.lock().unwrap() = self.raft.state();
+        let mut detailed_state = self.state.lock().unwrap();
+        detailed_state.state = self.raft.state();
+        if self.role_state() != RoleState::Leader {
+            detailed_state.expected_log_length = self.raft.log_length()
+        }
     }
 }
 
@@ -588,7 +601,7 @@ impl RaftStore {
 pub struct Node {
     // Your code here.
     sender: mpsc::UnboundedSender<Command>,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<DetailedState>>,
 }
 
 impl Node {
@@ -597,9 +610,12 @@ impl Node {
         // Your code here.
         let (sender, receiver) = mpsc::unbounded::<Command>();
         let sender_clone = sender.clone();
-        let state = Arc::new(Mutex::new(State {
-            term: 0,
-            is_leader: false,
+        let state = Arc::new(Mutex::new(DetailedState {
+            state: State {
+                term: 0,
+                is_leader: false,
+            },
+            expected_log_length: 0,
         }));
         let state_clone = state.clone();
         thread::spawn(move || raft_thread(raft, state_clone, receiver, sender_clone));
@@ -626,7 +642,18 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        unimplemented!()
+        let mut detailed_state = self.state.lock().unwrap();
+        let mut buf = vec![];
+        labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+        // Your code here (2B).
+
+        if detailed_state.state.is_leader {
+            let index=detailed_state.expected_log_length;
+            detailed_state.expected_log_length+=1;
+            Ok((index,detailed_state.state.term))
+        } else {
+            Err(Error::NotLeader)
+        }
     }
 
     /// The current term of this peer.
@@ -647,7 +674,7 @@ impl Node {
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
-        (*self.state.lock().unwrap()).clone()
+        self.state.lock().unwrap().state.clone()
     }
 
     /// the tester calls kill() when a Raft instance won't
@@ -680,7 +707,7 @@ impl RaftService for Node {
 
 fn raft_thread(
     raft: Raft,
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<DetailedState>>,
     receiver: mpsc::UnboundedReceiver<Command>,
     sender: mpsc::UnboundedSender<Command>,
 ) {
