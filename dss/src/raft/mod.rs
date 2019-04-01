@@ -130,7 +130,7 @@ impl Timing {
             self.election_timeout = Some(current_time + gen_election_timeout(&mut self.rng));
         }
     }
-    fn reset_when_becomes(&mut self, state: RoleState) {
+    fn reset_when_become(&mut self, state: RoleState) {
         let current_time = time::Instant::now();
         match state {
             RoleState::Follower => {
@@ -427,6 +427,12 @@ impl Raft {
         self.votes_granted.len() as u64 * 2 > self.peers_count()
     }
 
+    fn check_leader(&mut self, term: u64, leader: u64) {
+        if term >= self.current_term {
+            self.leader_id = Some(leader)
+        }
+    }
+
     fn add_log(&mut self, content: Vec<u8>) {
         self.log.push(Log {
             term: self.current_term,
@@ -443,19 +449,42 @@ impl Raft {
         }
     }
 
-    fn gen_heartbeat(&self,id:u64)->(u64,u64,Vec<Log>){
-        let next_index=self.next_index[id as usize]as usize;
-        if next_index<=1{
-            return (0,0,vec![])
+    fn gen_heartbeat(&self, id: u64) -> (u64, u64, Vec<Log>) {
+        let next_index = self.next_index[id as usize] as usize;
+        if next_index <= 1 {
+            return (0, 0, vec![]);
         }
-        let prev_log=self.log.get(next_index-2);
-        if let Some(log)=prev_log{
-            let prev_log_term=log.term;
+        let prev_log = self.log.get(next_index - 2);
+        if let Some(log) = prev_log {
+            let prev_log_term = log.term;
             // to be simple we only send one entry one time
-            let entries:Vec<Log>=self.log.get(next_index-1).into_iter().map(Clone::clone).collect();
-            (self.next_index[id as usize]-2,prev_log_term,entries)
-        }else{
-            (0,0,vec![])
+            let entries: Vec<Log> = self
+                .log
+                .get(next_index - 1)
+                .into_iter()
+                .map(Clone::clone)
+                .collect();
+            (self.next_index[id as usize] - 2, prev_log_term, entries)
+        } else {
+            (0, 0, vec![])
+        }
+    }
+
+    fn check_entries_valid(&self, term: u64, prev_log_index: u64, prev_log_term: u64) -> bool {
+        if term < self.current_term {
+            false
+        } else {
+            let term = self.log.get(prev_log_index as usize).map(|log| log.term);
+            term == Some(prev_log_term)
+        }
+    }
+
+    fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
+        let mut entries = entries;
+        self.log.truncate(prev_log_index as usize);
+        self.log.append(&mut entries);
+        if leader_commit > self.commit_index {
+            self.commit_index = std::cmp::min(leader_commit, self.log_length());
         }
     }
 }
@@ -504,7 +533,7 @@ impl RaftStore {
         let leader_commit = self.raft.commit_index;
         for id in 0..self.raft.peers_count() {
             if id != self.me() {
-                let (prev_log_index,prev_log_term,entries)=self.raft.gen_heartbeat(id);
+                let (prev_log_index, prev_log_term, entries) = self.raft.gen_heartbeat(id);
                 self.raft.send_append_entries(
                     id as usize,
                     &AppendEntriesArgs {
@@ -522,37 +551,37 @@ impl RaftStore {
     }
 
     fn start_election(&mut self) {
-        info!("Raft #{:?}: Start election, becomes candidate", self.me());
+        info!("Raft #{:?}: Start election, become candidate", self.me());
         //go to a higher term
         self.set_term(self.term() + 1);
         //init vote states
         self.raft.reset(RoleState::Candidate);
         //update timers
-        self.timing.reset_when_becomes(RoleState::Candidate);
+        self.timing.reset_when_become(RoleState::Candidate);
         //send vote request
         self.request_vote();
     }
 
     fn generic_request_handler(&mut self, term: u64) {
         if term > self.term() {
-            info!("Raft #{:?}: Found higher term, becomes follower", self.me());
+            info!("Raft #{:?}: Found higher term, become follower", self.me());
             //update term
             self.set_term(term);
             //convert to follower
             self.raft.reset(RoleState::Follower);
             //reset timing
-            self.timing.reset_when_becomes(RoleState::Follower)
+            self.timing.reset_when_become(RoleState::Follower)
         } else {
             self.timing.reset_election_timeout()
         }
     }
 
-    fn becomes_leader(&mut self) {
-        info!("Raft #{:?}: Vote granted, becomes leader", self.me());
+    fn become_leader(&mut self) {
+        info!("Raft #{:?}: Vote granted, become leader", self.me());
         // set leader
         self.raft.reset(RoleState::Leader);
         // reset timer
-        self.timing.reset_when_becomes(RoleState::Leader);
+        self.timing.reset_when_become(RoleState::Leader);
         // send heartbeat
         self.append_entries()
     }
@@ -583,11 +612,18 @@ impl RaftStore {
         sender: oneshot::Sender<AppendEntriesReply>,
     ) {
         self.generic_request_handler(args.term);
-        //TODO: decide when will it success
+        self.raft.check_leader(args.term, args.leader_id);
+        let success =
+            self.raft
+                .check_entries_valid(args.term, args.prev_log_index, args.prev_log_term);
+        if success {
+            self.raft
+                .apply_log(args.prev_log_index, args.entries, args.leader_commit)
+        }
         sender
             .send(AppendEntriesReply {
                 term: self.term(),
-                success: false,
+                success,
             })
             .unwrap_or_default();
     }
@@ -597,7 +633,7 @@ impl RaftStore {
         if self.role_state() == RoleState::Candidate {
             self.raft.update_vote(id, reply.vote_granted);
             if self.raft.check_vote() {
-                self.becomes_leader()
+                self.become_leader()
             }
         }
     }
