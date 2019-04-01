@@ -393,6 +393,10 @@ impl Raft {
             }
             RoleState::Leader => {
                 self.leader_id = Some(self.me as u64);
+                for id in 0..self.peers_count() as usize {
+                    self.next_index[id] = self.log_length() + 1;
+                    self.match_index[id] = if id != self.me { 0 } else { self.log_length() }
+                }
             }
         }
     }
