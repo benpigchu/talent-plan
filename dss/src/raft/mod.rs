@@ -486,11 +486,20 @@ impl RaftStore {
     fn append_entries(&mut self) {
         let term = self.term();
         let leader_id = self.me();
+        let leader_commit = self.raft.commit_index;
         for id in 0..self.raft.peers_count() {
             if id != self.me() {
                 self.raft.send_append_entries(
                     id as usize,
-                    &AppendEntriesArgs { term, leader_id },
+                    //TODO: decide last three pram
+                    &AppendEntriesArgs {
+                        term,
+                        leader_id,
+                        leader_commit,
+                        prev_log_index: 0,
+                        prev_log_term: 0,
+                        entries: vec![],
+                    },
                     &self.sender,
                 )
             }
@@ -559,8 +568,12 @@ impl RaftStore {
         sender: oneshot::Sender<AppendEntriesReply>,
     ) {
         self.generic_request_handler(args.term);
+        //TODO: decide when will it success
         sender
-            .send(AppendEntriesReply { term: self.term() })
+            .send(AppendEntriesReply {
+                term: self.term(),
+                success: false,
+            })
             .unwrap_or_default();
     }
 

@@ -35,15 +35,33 @@ pub struct RequestVoteReply {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct Entry {
+    #[prost(uint64, tag = "1")]
+    pub term: u64,
+    #[prost(bytes, tag = "2")]
+    pub command: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct AppendEntriesArgs {
     #[prost(uint64, tag = "1")]
     pub term: u64,
     #[prost(uint64, tag = "2")]
     pub leader_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub leader_commit: u64,
+    #[prost(uint64, tag = "4")]
+    pub prev_log_index: u64,
+    #[prost(uint64, tag = "5")]
+    pub prev_log_term: u64,
+    #[prost(message, repeated, tag = "6")]
+    pub entries: Vec<Entry>,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct AppendEntriesReply {
     #[prost(uint64, tag = "1")]
     pub term: u64,
+    #[prost(bool, tag = "2")]
+    pub success: bool,
 }
