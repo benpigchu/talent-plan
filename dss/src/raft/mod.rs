@@ -437,7 +437,9 @@ impl Raft {
         self.log.push(Log {
             term: self.current_term,
             command: content,
-        })
+        });
+        self.next_index[self.me] += 1;
+        self.match_index[self.me] += 1;
     }
 
     fn last_log_info(&mut self) -> (u64, u64) {
@@ -492,6 +494,29 @@ impl Raft {
             self.commit_index = std::cmp::min(leader_commit, self.log_length());
         }
     }
+
+    fn append_success(&mut self, id: u64) {
+        let id = id as usize;
+        let entries_count = if self.log.get(self.next_index[id] as usize - 1).is_some() {
+            1
+        } else {
+            0
+        };
+        self.next_index[id] += entries_count;
+        self.match_index[id] = self.next_index[id] - 1;
+        if entries_count > 0 {
+            self.check_commit();
+        }
+    }
+
+    fn append_failed(&mut self, id: u64) {
+        let id = id as usize;
+        if self.next_index[id] > 1 {
+            self.next_index[id] -= 1;
+        }
+    }
+
+    fn check_commit(&mut self) {}
 }
 
 struct RaftStore {
@@ -622,12 +647,15 @@ impl RaftStore {
             self.raft
                 .check_entries_valid(args.term, args.prev_log_index, args.prev_log_term);
         if success {
-            info!(
-                "Raft #{:?}: Apply {:?} entries begin at {:?}",
-                self.me(),
-                args.entries.len(),
-                args.prev_log_index
-            );
+            if !args.entries.is_empty() {
+                info!(
+                    "Raft #{:?}: Apply entries from {:?} in range {:?} to {:?}",
+                    self.me(),
+                    args.leader_id,
+                    args.prev_log_index+1,
+                    args.prev_log_index+args.entries.len() as u64,
+                );
+            }
             self.raft
                 .apply_log(args.prev_log_index, args.entries, args.leader_commit)
         }
@@ -651,6 +679,11 @@ impl RaftStore {
 
     fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply) {
         self.generic_request_handler(reply.term);
+        if reply.success {
+            self.raft.append_success(id)
+        } else {
+            self.raft.append_failed(id)
+        }
     }
 
     fn process_log(&mut self, content: Vec<u8>) {
