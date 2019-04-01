@@ -491,7 +491,7 @@ impl Raft {
         self.log.truncate(prev_log_index as usize);
         self.log.append(&mut entries);
         if leader_commit > self.commit_index {
-            self.commit_index = std::cmp::min(leader_commit, self.log_length());
+            self.update_commit_index(std::cmp::min(leader_commit, self.log_length()));
         }
     }
 
@@ -516,7 +516,26 @@ impl Raft {
         }
     }
 
-    fn check_commit(&mut self) {}
+    fn check_commit(&mut self) {
+        // a not that naive but not best implemention
+        let mut match_index_sorted = self.match_index.clone();
+        match_index_sorted.sort_unstable();
+        debug!("Raft #{:?}: Match {:?}", self.me, match_index_sorted);
+
+        let half_of_server = ((self.peers_count() - 1) / 2) as usize;
+        let more_than_half_matched = match_index_sorted[half_of_server];
+        if more_than_half_matched > 0
+            && self.log[more_than_half_matched as usize - 1].term == self.current_term
+        {
+            self.update_commit_index(more_than_half_matched)
+        }
+    }
+    fn update_commit_index(&mut self, index: u64) {
+        if self.commit_index < index {
+            info!("Raft #{:?}: Commited {:?}", self.me, index);
+            self.commit_index = index
+        }
+    }
 }
 
 struct RaftStore {
@@ -652,8 +671,8 @@ impl RaftStore {
                     "Raft #{:?}: Apply entries from {:?} in range {:?} to {:?}",
                     self.me(),
                     args.leader_id,
-                    args.prev_log_index+1,
-                    args.prev_log_index+args.entries.len() as u64,
+                    args.prev_log_index + 1,
+                    args.prev_log_index + args.entries.len() as u64,
                 );
             }
             self.raft
@@ -689,7 +708,7 @@ impl RaftStore {
     fn process_log(&mut self, content: Vec<u8>) {
         if self.role_state() == RoleState::Leader {
             let term = self.term();
-            let index = self.raft.log_length();
+            let index = self.raft.log_length() + 1;
             info!(
                 "Raft #{:?}: Add log in term {:?} at index {:?}",
                 self.me(),
