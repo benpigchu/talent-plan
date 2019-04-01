@@ -175,11 +175,6 @@ fn gen_heartbeat_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(HEARTBEAT_TIMEOUT)
 }
 
-struct Log {
-    term: u64,
-    command: Vec<u8>,
-}
-
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -447,6 +442,22 @@ impl Raft {
             (0, 0)
         }
     }
+
+    fn gen_heartbeat(&self,id:u64)->(u64,u64,Vec<Log>){
+        let next_index=self.next_index[id as usize]as usize;
+        if next_index<=1{
+            return (0,0,vec![])
+        }
+        let prev_log=self.log.get(next_index-2);
+        if let Some(log)=prev_log{
+            let prev_log_term=log.term;
+            // to be simple we only send one entry one time
+            let entries:Vec<Log>=self.log.get(next_index-1).into_iter().map(Clone::clone).collect();
+            (self.next_index[id as usize]-2,prev_log_term,entries)
+        }else{
+            (0,0,vec![])
+        }
+    }
 }
 
 struct RaftStore {
@@ -493,16 +504,16 @@ impl RaftStore {
         let leader_commit = self.raft.commit_index;
         for id in 0..self.raft.peers_count() {
             if id != self.me() {
+                let (prev_log_index,prev_log_term,entries)=self.raft.gen_heartbeat(id);
                 self.raft.send_append_entries(
                     id as usize,
-                    //TODO: decide last three pram
                     &AppendEntriesArgs {
                         term,
                         leader_id,
                         leader_commit,
-                        prev_log_index: 0,
-                        prev_log_term: 0,
-                        entries: vec![],
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
                     },
                     &self.sender,
                 )

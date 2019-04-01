@@ -35,7 +35,7 @@ pub struct RequestVoteReply {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct Entry {
+pub struct Log {
     #[prost(uint64, tag = "1")]
     pub term: u64,
     #[prost(bytes, tag = "2")]
@@ -55,7 +55,7 @@ pub struct AppendEntriesArgs {
     #[prost(uint64, tag = "5")]
     pub prev_log_term: u64,
     #[prost(message, repeated, tag = "6")]
-    pub entries: Vec<Entry>,
+    pub entries: Vec<Log>,
 }
 
 #[derive(Clone, PartialEq, Message)]
