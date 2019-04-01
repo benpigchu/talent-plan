@@ -18,6 +18,10 @@ pub struct RequestVoteArgs {
     pub term: u64,
     #[prost(uint64, tag = "2")]
     pub candidate_id: u64,
+    #[prost(uint64, tag = "3")]
+    pub last_log_index: u64,
+    #[prost(uint64, tag = "4")]
+    pub last_log_term: u64,
 }
 
 // Example RequestVote RPC reply structure.

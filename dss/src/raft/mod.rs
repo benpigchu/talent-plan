@@ -69,6 +69,7 @@ enum Incoming {
     AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
     Vote(u64, RequestVoteReply),
     Feedback(u64, AppendEntriesReply),
+    Log(Vec<u8>),
 }
 
 ///Message to the raft thread
@@ -403,12 +404,18 @@ impl Raft {
         }
     }
 
-    fn vote(&mut self, id: u64, term: u64) -> bool {
+    fn vote(&mut self, id: u64, term: u64, last_log_index: u64, last_log_term: u64) -> bool {
         let vote = if let Some(voted_id) = self.voted_for {
             id == voted_id
+        } else if self.current_term <= term {
+            let (current_last_log_index, current_last_log_term) = self.last_log_info();
+            if current_last_log_term != last_log_term {
+                current_last_log_term < last_log_term
+            } else {
+                current_last_log_index <= last_log_index
+            }
         } else {
-            // TODO: log related vote
-            self.current_term <= term
+            false
         };
         if self.voted_for.is_none() && vote {
             info!("Raft #{:?}: Vote for {:?}", self.me, id);
@@ -419,6 +426,22 @@ impl Raft {
 
     fn check_vote(&self) -> bool {
         self.votes_granted.len() as u64 * 2 > self.peers_count()
+    }
+
+    fn add_log(&mut self, content: Vec<u8>) {
+        self.log.push(Log {
+            term: self.current_term,
+            command: content,
+        })
+    }
+
+    fn last_log_info(&mut self) -> (u64, u64) {
+        let last_log = self.log.last();
+        if let Some(log) = last_log {
+            (log.term, self.log.len() as u64)
+        } else {
+            (0, 0)
+        }
     }
 }
 
@@ -443,12 +466,17 @@ impl RaftStore {
         self.raft.role_state()
     }
     fn request_vote(&mut self) {
+        let term = self.term();
+        let candidate_id = self.me();
+        let (last_log_index, last_log_term) = self.raft.last_log_info();
         for id in &self.raft.votes_not_respond {
             self.raft.send_request_vote(
                 *id as usize,
                 &RequestVoteArgs {
-                    term: self.term(),
-                    candidate_id: self.me(),
+                    term,
+                    candidate_id,
+                    last_log_index,
+                    last_log_term,
                 },
                 &self.sender,
             )
@@ -456,14 +484,13 @@ impl RaftStore {
     }
 
     fn append_entries(&mut self) {
+        let term = self.term();
+        let leader_id = self.me();
         for id in 0..self.raft.peers_count() {
             if id != self.me() {
                 self.raft.send_append_entries(
                     id as usize,
-                    &AppendEntriesArgs {
-                        term: self.term(),
-                        leader_id: self.me(),
-                    },
+                    &AppendEntriesArgs { term, leader_id },
                     &self.sender,
                 )
             }
@@ -512,7 +539,12 @@ impl RaftStore {
         sender: oneshot::Sender<RequestVoteReply>,
     ) {
         self.generic_request_handler(args.term);
-        let vote = self.raft.vote(args.candidate_id, args.term);
+        let vote = self.raft.vote(
+            args.candidate_id,
+            args.term,
+            args.last_log_index,
+            args.last_log_term,
+        );
         sender
             .send(RequestVoteReply {
                 term: self.term(),
@@ -546,6 +578,20 @@ impl RaftStore {
         self.generic_request_handler(reply.term);
     }
 
+    fn process_log(&mut self, content: Vec<u8>) {
+        if self.role_state() == RoleState::Leader {
+            let term = self.term();
+            let index = self.raft.log_length();
+            info!(
+                "Raft #{:?}: Add log in term {:?} at index {:?}",
+                self.me(),
+                term,
+                index
+            );
+            self.raft.add_log(content)
+        }
+    }
+
     fn process_task(&mut self, task: Task) {
         match (self.role_state(), task) {
             (RoleState::Follower, Task::Timeout(TimeoutType::Heartbeat)) => {
@@ -572,6 +618,7 @@ impl RaftStore {
             }
             (_, Task::Packet(Incoming::Vote(id, reply))) => self.process_vote(id, reply),
             (_, Task::Packet(Incoming::Feedback(id, reply))) => self.process_feedback(id, reply),
+            (_, Task::Packet(Incoming::Log(content))) => self.process_log(content),
         }
     }
     fn update_state(&mut self) {
@@ -648,9 +695,11 @@ impl Node {
         // Your code here (2B).
 
         if detailed_state.state.is_leader {
-            let index=detailed_state.expected_log_length;
-            detailed_state.expected_log_length+=1;
-            Ok((index,detailed_state.state.term))
+            //index here start from 1
+            detailed_state.expected_log_length += 1;
+            let index = detailed_state.expected_log_length;
+            push_inbound(&self.sender, Incoming::Log(buf));
+            Ok((index, detailed_state.state.term))
         } else {
             Err(Error::NotLeader)
         }
