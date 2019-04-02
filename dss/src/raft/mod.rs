@@ -343,7 +343,7 @@ impl Raft {
         // Example:
         // ```
         // let (tx, rx) = channel();
-        trace!("Raft #{:?}: Send append entries {:?}", self.me, args);
+        debug!("Raft #{:?}: Send append entries {:?}", self.me, args);
         let sender_clone = sender.clone();
         peer.spawn(
             peer.append_entries(&args)
@@ -410,6 +410,7 @@ impl Raft {
             id == voted_id
         } else if self.current_term <= term {
             let (current_last_log_index, current_last_log_term) = self.last_log_info();
+            debug!("Raft #{:?}: Check vote for {:?}, Self: index {:?} in term {:?}, Candidate: index {:?} in term {:?}", self.me, id,current_last_log_index,current_last_log_term,last_log_index,last_log_term);
             if current_last_log_term != last_log_term {
                 current_last_log_term < last_log_term
             } else {
@@ -447,7 +448,7 @@ impl Raft {
     fn last_log_info(&mut self) -> (u64, u64) {
         let last_log = self.log.last();
         if let Some(log) = last_log {
-            (log.term, self.log.len() as u64)
+            (self.log.len() as u64, log.term)
         } else {
             (0, 0)
         }
@@ -458,22 +459,13 @@ impl Raft {
         if next_index < 1 {
             return (0, 0, vec![]);
         }
-        let prev_log = if next_index >= 2 {
-            self.log.get(next_index - 2)
-        } else {
-            None
-        };
-        debug!(
-            "Raft #{:?}: State at gen_heartbeat: Log: {:?}, Next index:{:?}",
-            self.me, self.log, next_index
-        );
-        let (prev_log_index, prev_log_term) = if let Some(log) = prev_log {
-            let prev_log_term = log.term;
-            // to be simple we only send one entry one time
-            (self.next_index[id as usize] - 2, prev_log_term)
+        let (prev_log_index, prev_log_term) = if next_index >= 2 {
+            let prev_log = &self.log[next_index - 2];
+            (self.next_index[id as usize] - 1, prev_log.term)
         } else {
             (0, 0)
         };
+        // to be simple we only send one entry one time
         let entries: Vec<Log> = self
             .log
             .get(next_index - 1)
@@ -506,20 +498,7 @@ impl Raft {
     fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
         let mut entries = entries;
         self.truncate_log(prev_log_index as usize);
-        trace!(
-            "Raft #{:?}: Log length before append: {:?}, Entries count: {:?}",
-            self.me,
-            self.log_length(),
-            entries.len()
-        );
         self.log.append(&mut entries);
-        trace!(
-            "Raft #{:?}: Leader commit: {:?}. Self commit: {:?}. Log length: {:?}",
-            self.me,
-            leader_commit,
-            self.commit_index,
-            self.log_length()
-        );
         if leader_commit > self.commit_index {
             self.update_commit_index(std::cmp::min(leader_commit, self.log_length()));
         }
@@ -717,6 +696,9 @@ impl RaftStore {
         sender: oneshot::Sender<AppendEntriesReply>,
     ) {
         self.generic_request_handler(args.term);
+        if self.role_state() == RoleState::Candidate {
+            self.raft.reset(RoleState::Follower);
+        }
         self.raft.check_leader(args.term, args.leader_id);
         let success =
             self.raft
