@@ -55,7 +55,7 @@ struct DetailedState {
 }
 
 /// The current role of the node
-#[derive(PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 enum RoleState {
     Follower,
     Candidate,
@@ -173,6 +173,26 @@ fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
 
 fn gen_heartbeat_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(HEARTBEAT_TIMEOUT)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LogInfo {
+    last_log_term: u64,
+    last_log_index: u64,
+}
+
+impl Ord for LogInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.last_log_term
+            .cmp(&other.last_log_term)
+            .then_with(|| self.last_log_index.cmp(&other.last_log_index))
+    }
+}
+
+impl PartialOrd for LogInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 // A single Raft peer.
@@ -405,17 +425,16 @@ impl Raft {
         }
     }
 
-    fn vote(&mut self, id: u64, term: u64, last_log_index: u64, last_log_term: u64) -> bool {
+    fn vote(&mut self, id: u64, term: u64, log_info: LogInfo) -> bool {
         let vote = if let Some(voted_id) = self.voted_for {
             id == voted_id
         } else if self.current_term <= term {
-            let (current_last_log_index, current_last_log_term) = self.last_log_info();
-            debug!("Raft #{:?}: Check vote for {:?}, Self: index {:?} in term {:?}, Candidate: index {:?} in term {:?}", self.me, id,current_last_log_index,current_last_log_term,last_log_index,last_log_term);
-            if current_last_log_term != last_log_term {
-                current_last_log_term < last_log_term
-            } else {
-                current_last_log_index <= last_log_index
-            }
+            let self_log_info = self.last_log_info();
+            debug!(
+                "Raft #{:?}: Check vote for {:?}, Self: {:?}, Candidate: {:?}",
+                self.me, id, self_log_info, log_info
+            );
+            self_log_info <= log_info
         } else {
             false
         };
@@ -445,12 +464,18 @@ impl Raft {
         self.match_index[self.me] += 1;
     }
 
-    fn last_log_info(&mut self) -> (u64, u64) {
+    fn last_log_info(&mut self) -> LogInfo {
         let last_log = self.log.last();
         if let Some(log) = last_log {
-            (self.log.len() as u64, log.term)
+            LogInfo {
+                last_log_index: self.log.len() as u64,
+                last_log_term: log.term,
+            }
         } else {
-            (0, 0)
+            LogInfo {
+                last_log_index: 0,
+                last_log_term: 0,
+            }
         }
     }
 
@@ -595,7 +620,10 @@ impl RaftStore {
         debug!("Raft #{:?}: Request vote heartbeat", self.me());
         let term = self.term();
         let candidate_id = self.me();
-        let (last_log_index, last_log_term) = self.raft.last_log_info();
+        let LogInfo {
+            last_log_index,
+            last_log_term,
+        } = self.raft.last_log_info();
         for id in &self.raft.votes_not_respond {
             self.raft.send_request_vote(
                 *id as usize,
@@ -679,8 +707,10 @@ impl RaftStore {
         let vote = self.raft.vote(
             args.candidate_id,
             args.term,
-            args.last_log_index,
-            args.last_log_term,
+            LogInfo {
+                last_log_index: args.last_log_index,
+                last_log_term: args.last_log_term,
+            },
         );
         sender
             .send(RequestVoteReply {
