@@ -10,6 +10,29 @@ pub use self::raft::{
     add_service as add_raft_service, Client as RaftClient, Service as RaftService,
 };
 
+#[derive(Copy, Clone, Eq, PartialEq, Message)]
+pub struct LogInfo {
+    #[prost(uint64, tag = "1")]
+    pub log_term: u64,
+    #[prost(uint64, tag = "2")]
+    pub log_index: u64,
+}
+
+// The "more up-to-date" compare
+impl Ord for LogInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.log_term
+            .cmp(&other.log_term)
+            .then_with(|| self.log_index.cmp(&other.log_index))
+    }
+}
+
+impl PartialOrd for LogInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Example RequestVote RPC arguments structure.
 #[derive(Clone, PartialEq, Message)]
 pub struct RequestVoteArgs {
@@ -18,10 +41,8 @@ pub struct RequestVoteArgs {
     pub term: u64,
     #[prost(uint64, tag = "2")]
     pub candidate_id: u64,
-    #[prost(uint64, tag = "3")]
-    pub last_log_index: u64,
-    #[prost(uint64, tag = "4")]
-    pub last_log_term: u64,
+    #[prost(message, required, tag = "3")]
+    pub last_log_info: LogInfo,
 }
 
 // Example RequestVote RPC reply structure.
@@ -50,11 +71,9 @@ pub struct AppendEntriesArgs {
     pub leader_id: u64,
     #[prost(uint64, tag = "3")]
     pub leader_commit: u64,
-    #[prost(uint64, tag = "4")]
-    pub prev_log_index: u64,
-    #[prost(uint64, tag = "5")]
-    pub prev_log_term: u64,
-    #[prost(message, repeated, tag = "6")]
+    #[prost(message, required, tag = "4")]
+    pub prev_log_info: LogInfo,
+    #[prost(message, repeated, tag = "5")]
     pub entries: Vec<Log>,
 }
 

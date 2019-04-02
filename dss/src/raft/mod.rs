@@ -165,7 +165,7 @@ impl Timing {
 
 const ELECTION_TIMEOUT_MIN: u64 = 200;
 const ELECTION_TIMEOUT_MAX: u64 = 400;
-const HEARTBEAT_TIMEOUT: u64 = 75;
+const HEARTBEAT_TIMEOUT: u64 = 50;
 
 fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
@@ -173,26 +173,6 @@ fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
 
 fn gen_heartbeat_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(HEARTBEAT_TIMEOUT)
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct LogInfo {
-    last_log_term: u64,
-    last_log_index: u64,
-}
-
-impl Ord for LogInfo {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.last_log_term
-            .cmp(&other.last_log_term)
-            .then_with(|| self.last_log_index.cmp(&other.last_log_index))
-    }
-}
-
-impl PartialOrd for LogInfo {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 // A single Raft peer.
@@ -472,27 +452,39 @@ impl Raft {
         let last_log = self.log.last();
         if let Some(log) = last_log {
             LogInfo {
-                last_log_index: self.log.len() as u64,
-                last_log_term: log.term,
+                log_index: self.log.len() as u64,
+                log_term: log.term,
             }
         } else {
             LogInfo {
-                last_log_index: 0,
-                last_log_term: 0,
+                log_index: 0,
+                log_term: 0,
             }
         }
     }
 
-    fn gen_heartbeat(&self, id: u64) -> (u64, u64, Vec<Log>) {
+    fn gen_heartbeat(&self, id: u64) -> (LogInfo, Vec<Log>) {
         let next_index = self.next_index[id as usize] as usize;
         if next_index < 1 {
-            return (0, 0, vec![]);
+            return (
+                LogInfo {
+                    log_index: 0,
+                    log_term: 0,
+                },
+                vec![],
+            );
         }
-        let (prev_log_index, prev_log_term) = if next_index >= 2 {
+        let prev_log_info = if next_index >= 2 {
             let prev_log = &self.log[next_index - 2];
-            (self.next_index[id as usize] - 1, prev_log.term)
+            LogInfo {
+                log_index: self.next_index[id as usize] - 1,
+                log_term: prev_log.term,
+            }
         } else {
-            (0, 0)
+            LogInfo {
+                log_index: 0,
+                log_term: 0,
+            }
         };
         // to be simple we only send one entry one time
         let entries: Vec<Log> = self
@@ -501,10 +493,14 @@ impl Raft {
             .into_iter()
             .map(Clone::clone)
             .collect();
-        (prev_log_index, prev_log_term, entries)
+        (prev_log_info, entries)
     }
 
-    fn check_entries_valid(&self, term: u64, prev_log_index: u64, prev_log_term: u64) -> bool {
+    fn check_entries_valid(&self, term: u64, prev_log_info: LogInfo) -> bool {
+        let LogInfo {
+            log_index: prev_log_index,
+            log_term: prev_log_term,
+        } = prev_log_info;
         if term < self.current_term {
             false
         } else if prev_log_index < 1 {
@@ -627,18 +623,14 @@ impl RaftStore {
         debug!("Raft #{:?}: Request vote heartbeat", self.me());
         let term = self.term();
         let candidate_id = self.me();
-        let LogInfo {
-            last_log_index,
-            last_log_term,
-        } = self.raft.last_log_info();
+        let last_log_info = self.raft.last_log_info();
         for id in &self.raft.votes_not_respond {
             self.raft.send_request_vote(
                 *id as usize,
                 &RequestVoteArgs {
                     term,
                     candidate_id,
-                    last_log_index,
-                    last_log_term,
+                    last_log_info,
                 },
                 &self.sender,
             )
@@ -652,15 +644,14 @@ impl RaftStore {
         let leader_commit = self.raft.commit_index;
         for id in 0..self.raft.peers_count() {
             if id != self.me() {
-                let (prev_log_index, prev_log_term, entries) = self.raft.gen_heartbeat(id);
+                let (prev_log_info, entries) = self.raft.gen_heartbeat(id);
                 self.raft.send_append_entries(
                     id as usize,
                     &AppendEntriesArgs {
                         term,
                         leader_id,
                         leader_commit,
-                        prev_log_index,
-                        prev_log_term,
+                        prev_log_info,
                         entries,
                     },
                     &self.sender,
@@ -714,14 +705,9 @@ impl RaftStore {
         sender: oneshot::Sender<RequestVoteReply>,
     ) {
         self.generic_request_handler(args.term);
-        let vote = self.raft.vote(
-            args.candidate_id,
-            args.term,
-            LogInfo {
-                last_log_index: args.last_log_index,
-                last_log_term: args.last_log_term,
-            },
-        );
+        let vote = self
+            .raft
+            .vote(args.candidate_id, args.term, args.last_log_info);
         sender
             .send(RequestVoteReply {
                 term: self.term(),
@@ -740,21 +726,20 @@ impl RaftStore {
             self.become_follower()
         }
         self.raft.check_leader(args.term, args.leader_id);
-        let success =
-            self.raft
-                .check_entries_valid(args.term, args.prev_log_index, args.prev_log_term);
+        let success = self.raft.check_entries_valid(args.term, args.prev_log_info);
         if success {
+            let prev_log_index = args.prev_log_info.log_index;
             if !args.entries.is_empty() {
                 info!(
                     "Raft #{:?}: Apply entries from {:?} in range {:?} to {:?}",
                     self.me(),
                     args.leader_id,
-                    args.prev_log_index + 1,
-                    args.prev_log_index + args.entries.len() as u64,
+                    prev_log_index + 1,
+                    prev_log_index + args.entries.len() as u64,
                 );
             }
             self.raft
-                .apply_log(args.prev_log_index, args.entries, args.leader_commit)
+                .apply_log(prev_log_index, args.entries, args.leader_commit)
         }
         sender
             .send(AppendEntriesReply {
