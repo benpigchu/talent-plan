@@ -184,6 +184,7 @@ pub struct Raft {
     // this peer's index into peers[]
     me: usize,
     // state: Arc<State>,
+    apply_ch: mpsc::UnboundedSender<ApplyMsg>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -230,6 +231,7 @@ impl Raft {
             persister,
             me,
             // state: Arc::default(),
+            apply_ch,
             current_term: 0,
             log: Vec::new(),
             commit_index: 0,
@@ -318,7 +320,7 @@ impl Raft {
         // ```
         // let (tx, rx) = channel();
 
-        debug!("Raft #{:?}: Send request vote {:?}", self.me, args);
+        trace!("Raft #{:?}: Send request vote {:?}", self.me, args);
         let sender_clone = sender.clone();
         peer.spawn(
             peer.request_vote(&args)
@@ -341,7 +343,7 @@ impl Raft {
         // Example:
         // ```
         // let (tx, rx) = channel();
-        debug!("Raft #{:?}: Send append entries {:?}", self.me, args);
+        trace!("Raft #{:?}: Send append entries {:?}", self.me, args);
         let sender_clone = sender.clone();
         peer.spawn(
             peer.append_entries(&args)
@@ -453,23 +455,32 @@ impl Raft {
 
     fn gen_heartbeat(&self, id: u64) -> (u64, u64, Vec<Log>) {
         let next_index = self.next_index[id as usize] as usize;
-        if next_index <= 1 {
+        if next_index < 1 {
             return (0, 0, vec![]);
         }
-        let prev_log = self.log.get(next_index - 2);
-        if let Some(log) = prev_log {
+        let prev_log = if next_index >= 2 {
+            self.log.get(next_index - 2)
+        } else {
+            None
+        };
+        debug!(
+            "Raft #{:?}: State at gen_heartbeat: Log: {:?}, Next index:{:?}",
+            self.me, self.log, next_index
+        );
+        let (prev_log_index, prev_log_term) = if let Some(log) = prev_log {
             let prev_log_term = log.term;
             // to be simple we only send one entry one time
-            let entries: Vec<Log> = self
-                .log
-                .get(next_index - 1)
-                .into_iter()
-                .map(Clone::clone)
-                .collect();
-            (self.next_index[id as usize] - 2, prev_log_term, entries)
+            (self.next_index[id as usize] - 2, prev_log_term)
         } else {
-            (0, 0, vec![])
-        }
+            (0, 0)
+        };
+        let entries: Vec<Log> = self
+            .log
+            .get(next_index - 1)
+            .into_iter()
+            .map(Clone::clone)
+            .collect();
+        (prev_log_index, prev_log_term, entries)
     }
 
     fn check_entries_valid(&self, term: u64, prev_log_index: u64, prev_log_term: u64) -> bool {
@@ -486,10 +497,29 @@ impl Raft {
         }
     }
 
+    fn truncate_log(&mut self, new_length: usize) {
+        for (id, log) in self.log.split_off(new_length).into_iter().enumerate() {
+            self.drop_entry(log.command, (id + new_length + 1) as u64);
+        }
+    }
+
     fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
         let mut entries = entries;
-        self.log.truncate(prev_log_index as usize);
+        self.truncate_log(prev_log_index as usize);
+        trace!(
+            "Raft #{:?}: Log length before append: {:?}, Entries count: {:?}",
+            self.me,
+            self.log_length(),
+            entries.len()
+        );
         self.log.append(&mut entries);
+        trace!(
+            "Raft #{:?}: Leader commit: {:?}. Self commit: {:?}. Log length: {:?}",
+            self.me,
+            leader_commit,
+            self.commit_index,
+            self.log_length()
+        );
         if leader_commit > self.commit_index {
             self.update_commit_index(std::cmp::min(leader_commit, self.log_length()));
         }
@@ -533,8 +563,32 @@ impl Raft {
     fn update_commit_index(&mut self, index: u64) {
         if self.commit_index < index {
             info!("Raft #{:?}: Commited {:?}", self.me, index);
+            for id in self.commit_index..index {
+                self.commit_entry(self.log[id as usize].command.clone(), id + 1)
+            }
             self.commit_index = index
         }
+    }
+
+    fn drop_entry(&mut self, command: Vec<u8>, index: u64) {
+        self.apply_ch
+            .unbounded_send(ApplyMsg {
+                command_valid: false,
+                command,
+                command_index: index,
+            })
+            .unwrap_or_default();
+    }
+
+    fn commit_entry(&mut self, command: Vec<u8>, index: u64) {
+        debug!("Raft #{:?}: ApplyMsg {:?} at {:?}", self.me, command, index);
+        self.apply_ch
+            .unbounded_send(ApplyMsg {
+                command_valid: true,
+                command,
+                command_index: index,
+            })
+            .unwrap_or_default();
     }
 }
 
@@ -559,6 +613,7 @@ impl RaftStore {
         self.raft.role_state()
     }
     fn request_vote(&mut self) {
+        debug!("Raft #{:?}: Request vote heartbeat", self.me());
         let term = self.term();
         let candidate_id = self.me();
         let (last_log_index, last_log_term) = self.raft.last_log_info();
@@ -577,6 +632,7 @@ impl RaftStore {
     }
 
     fn append_entries(&mut self) {
+        debug!("Raft #{:?}: Append entries heartbeat", self.me());
         let term = self.term();
         let leader_id = self.me();
         let leader_commit = self.raft.commit_index;
@@ -716,6 +772,8 @@ impl RaftStore {
                 index
             );
             self.raft.add_log(content)
+        } else {
+            self.raft.drop_entry(content, self.raft.log_length() + 1)
         }
     }
 
@@ -920,7 +978,7 @@ fn raft_thread(
             Ok(Either::B((_, stream_future))) => (Task::Timeout(timeout_type), stream_future),
             Err(Either::B((error, stream_future))) => panic!("My timer gives me an error!"),
         };
-        debug!("Raft #{:?}: Get task {:?}", raft_store.me(), task);
+        trace!("Raft #{:?}: Get task {:?}", raft_store.me(), task);
         receiver_future = new_receiver_future;
 
         // process message/timeout
