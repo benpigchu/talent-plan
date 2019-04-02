@@ -68,7 +68,7 @@ enum Incoming {
     RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
     AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
     Vote(u64, RequestVoteReply),
-    Feedback(u64, AppendEntriesReply),
+    Feedback(u64, AppendEntriesReply, u64),
     Log(Vec<u8>),
 }
 
@@ -365,11 +365,15 @@ impl Raft {
         // let (tx, rx) = channel();
         trace!("Raft #{:?}: Send append entries {:?}", self.me, args);
         let sender_clone = sender.clone();
+        let entries_count = args.entries.len() as u64;
         peer.spawn(
             peer.append_entries(&args)
                 .map_err(|err| ())
                 .and_then(move |res| {
-                    push_inbound(&sender_clone, Incoming::Feedback(server as u64, res));
+                    push_inbound(
+                        &sender_clone,
+                        Incoming::Feedback(server as u64, res, entries_count),
+                    );
                     Ok(())
                 }),
         );
@@ -529,13 +533,8 @@ impl Raft {
         }
     }
 
-    fn append_success(&mut self, id: u64) {
+    fn append_success(&mut self, id: u64, entries_count: u64) {
         let id = id as usize;
-        let entries_count = if self.log.get(self.next_index[id] as usize - 1).is_some() {
-            1
-        } else {
-            0
-        };
         self.next_index[id] += entries_count;
         self.match_index[id] = self.next_index[id] - 1;
         if entries_count > 0 {
@@ -775,10 +774,10 @@ impl RaftStore {
         }
     }
 
-    fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply) {
+    fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply, entries_count: u64) {
         self.generic_request_handler(reply.term);
         if reply.success {
-            self.raft.append_success(id)
+            self.raft.append_success(id, entries_count)
         } else {
             self.raft.append_failed(id)
         }
@@ -825,7 +824,9 @@ impl RaftStore {
                 self.process_append_entries(arg, sender)
             }
             (_, Task::Packet(Incoming::Vote(id, reply))) => self.process_vote(id, reply),
-            (_, Task::Packet(Incoming::Feedback(id, reply))) => self.process_feedback(id, reply),
+            (_, Task::Packet(Incoming::Feedback(id, reply, entries_count))) => {
+                self.process_feedback(id, reply, entries_count)
+            }
             (_, Task::Packet(Incoming::Log(content))) => self.process_log(content),
         }
     }
