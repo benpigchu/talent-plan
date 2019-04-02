@@ -163,9 +163,9 @@ impl Timing {
     }
 }
 
-const ELECTION_TIMEOUT_MIN: u64 = 300;
-const ELECTION_TIMEOUT_MAX: u64 = 600;
-const HEARTBEAT_TIMEOUT: u64 = 100;
+const ELECTION_TIMEOUT_MIN: u64 = 200;
+const ELECTION_TIMEOUT_MAX: u64 = 400;
+const HEARTBEAT_TIMEOUT: u64 = 75;
 
 fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
@@ -363,7 +363,7 @@ impl Raft {
         // Example:
         // ```
         // let (tx, rx) = channel();
-        debug!("Raft #{:?}: Send append entries {:?}", self.me, args);
+        trace!("Raft #{:?}: Send append entries {:?}", self.me, args);
         let sender_clone = sender.clone();
         peer.spawn(
             peer.append_entries(&args)
@@ -611,7 +611,15 @@ impl RaftStore {
         self.raft.current_term
     }
     fn set_term(&mut self, term: u64) {
-        self.raft.current_term = term
+        if self.term() < term {
+            info!(
+                "Raft #{:?}: Enter new term {:?} -> {:?}",
+                self.me(),
+                self.term(),
+                term
+            );
+            self.raft.current_term = term
+        }
     }
     fn role_state(&self) -> RoleState {
         self.raft.role_state()
@@ -680,9 +688,7 @@ impl RaftStore {
             //update term
             self.set_term(term);
             //convert to follower
-            self.raft.reset(RoleState::Follower);
-            //reset timing
-            self.timing.reset_when_become(RoleState::Follower)
+            self.become_follower();
         } else {
             self.timing.reset_election_timeout()
         }
@@ -696,6 +702,11 @@ impl RaftStore {
         self.timing.reset_when_become(RoleState::Leader);
         // send heartbeat
         self.append_entries()
+    }
+
+    fn become_follower(&mut self) {
+        self.raft.reset(RoleState::Follower);
+        self.timing.reset_when_become(RoleState::Follower)
     }
 
     fn process_request_vote(
@@ -727,7 +738,7 @@ impl RaftStore {
     ) {
         self.generic_request_handler(args.term);
         if self.role_state() == RoleState::Candidate {
-            self.raft.reset(RoleState::Follower);
+            self.become_follower()
         }
         self.raft.check_leader(args.term, args.leader_id);
         let success =
