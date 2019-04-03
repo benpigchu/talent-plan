@@ -107,6 +107,16 @@ struct Timing {
     election_timeout: Option<time::Instant>,
 }
 
+#[derive(Message)]
+struct PersistState {
+    #[prost(uint64, tag = "1")]
+    current_term: u64,
+    #[prost(uint64, optional, tag = "2")]
+    voted_for: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    logs: Vec<Log>,
+}
+
 impl Timing {
     fn new() -> Self {
         let mut rng = rand::thread_rng();
@@ -188,16 +198,16 @@ pub struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
-    current_term: u64,
-    log: Vec<Log>,
-
+    persisted: PersistState,
+    // current_term: u64,
+    // log: Vec<Log>,
     commit_index: u64,
     last_applied: u64,
 
     // if leader is self, we are leader
     leader_id: Option<u64>,
     // if voted for self, we are candidate
-    voted_for: Option<u64>,
+    // voted_for: Option<u64>,//this field is now in persisted
     // elsewise, we are follower
 
     // special states for candidate
@@ -232,11 +242,13 @@ impl Raft {
             me,
             // state: Arc::default(),
             apply_ch,
-            current_term: 0,
-            log: Vec::new(),
+            persisted: PersistState {
+                current_term: 0,
+                voted_for: None,
+                logs: Vec::new(),
+            },
             commit_index: 0,
             last_applied: 0,
-            voted_for: None,
             leader_id: None,
             votes_granted: HashSet::new(),
             votes_not_respond: HashSet::new(),
@@ -250,12 +262,41 @@ impl Raft {
         rf
     }
 
+    fn voted_for(&self) -> Option<u64> {
+        self.persisted.voted_for
+    }
+
+    fn set_voted_for(&mut self, voted_for: Option<u64>) {
+        self.persisted.voted_for = voted_for;
+    }
+
+    fn logs(&self) -> &Vec<Log> {
+        &self.persisted.logs
+    }
+
+    fn logs_mut(&mut self) -> &mut Vec<Log> {
+        &mut self.persisted.logs
+    }
+
+    fn term(&self) -> u64 {
+        self.persisted.current_term
+    }
+    fn set_term(&mut self, term: u64) {
+        if self.persisted.current_term < term {
+            info!(
+                "Raft #{:?}: Enter new term {:?} -> {:?}",
+                self.me, self.persisted.current_term, term
+            );
+            self.persisted.current_term = term
+        }
+    }
+
     /// a helper used to get the current role state
     fn role_state(&self) -> RoleState {
         if self.leader_id == Some(self.me as u64) {
             return RoleState::Leader;
         }
-        if self.voted_for == Some(self.me as u64) {
+        if self.voted_for() == Some(self.me as u64) {
             return RoleState::Candidate;
         }
         RoleState::Follower
@@ -270,6 +311,8 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let mut data = Vec::<u8>::new();
+        labcodec::encode(&self.persisted, &mut data).unwrap();
     }
 
     /// restore previously persisted state.
@@ -361,7 +404,7 @@ impl Raft {
 
     fn state(&self) -> State {
         State {
-            term: self.current_term,
+            term: self.term(),
             is_leader: self.role_state() == RoleState::Leader,
         }
     }
@@ -371,18 +414,18 @@ impl Raft {
     }
 
     fn log_length(&self) -> u64 {
-        self.log.len() as u64
+        self.persisted.logs.len() as u64
     }
 
     fn reset(&mut self, role_state: RoleState) {
         match role_state {
             RoleState::Follower => {
                 self.leader_id = None;
-                self.voted_for = None;
+                self.set_voted_for(None);
             }
             RoleState::Candidate => {
                 self.leader_id = None;
-                self.voted_for = Some(self.me as u64);
+                self.set_voted_for(Some(self.me as u64));
                 self.votes_granted.clear();
                 self.votes_granted.insert(self.me as u64);
                 self.votes_not_respond.clear();
@@ -410,9 +453,9 @@ impl Raft {
     }
 
     fn vote(&mut self, id: u64, term: u64, log_info: LogInfo) -> bool {
-        let vote = if let Some(voted_id) = self.voted_for {
+        let vote = if let Some(voted_id) = self.voted_for() {
             id == voted_id
-        } else if self.current_term <= term {
+        } else if self.term() <= term {
             let self_log_info = self.last_log_info();
             debug!(
                 "Raft #{:?}: Check vote for {:?}, Self: {:?}, Candidate: {:?}",
@@ -422,9 +465,9 @@ impl Raft {
         } else {
             false
         };
-        if self.voted_for.is_none() && vote {
+        if self.voted_for().is_none() && vote {
             info!("Raft #{:?}: Vote for {:?}", self.me, id);
-            self.voted_for = Some(id)
+            self.set_voted_for(Some(id));
         }
         vote
     }
@@ -434,14 +477,15 @@ impl Raft {
     }
 
     fn check_leader(&mut self, term: u64, leader: u64) {
-        if term >= self.current_term {
+        if term >= self.term() {
             self.leader_id = Some(leader)
         }
     }
 
     fn add_log(&mut self, content: Vec<u8>) {
-        self.log.push(Log {
-            term: self.current_term,
+        let term = self.term();
+        self.logs_mut().push(Log {
+            term,
             command: content,
         });
         self.next_index[self.me] += 1;
@@ -449,10 +493,11 @@ impl Raft {
     }
 
     fn last_log_info(&mut self) -> LogInfo {
-        let last_log = self.log.last();
+        let logs = self.logs_mut();
+        let last_log = logs.last();
         if let Some(log) = last_log {
             LogInfo {
-                log_index: self.log.len() as u64,
+                log_index: logs.len() as u64,
                 log_term: log.term,
             }
         } else {
@@ -475,7 +520,7 @@ impl Raft {
             );
         }
         let prev_log_info = if next_index >= 2 {
-            let prev_log = &self.log[next_index - 2];
+            let prev_log = &self.logs()[next_index - 2];
             LogInfo {
                 log_index: self.next_index[id as usize] - 1,
                 log_term: prev_log.term,
@@ -488,7 +533,7 @@ impl Raft {
         };
         // to be simple we only send one entry one time
         let entries: Vec<Log> = self
-            .log
+            .logs()
             .get(next_index - 1)
             .into_iter()
             .map(Clone::clone)
@@ -501,13 +546,13 @@ impl Raft {
             log_index: prev_log_index,
             log_term: prev_log_term,
         } = prev_log_info;
-        if term < self.current_term {
+        if term < self.term() {
             false
         } else if prev_log_index < 1 {
             true
         } else {
             let term = self
-                .log
+                .logs()
                 .get(prev_log_index as usize - 1)
                 .map(|log| log.term);
             term == Some(prev_log_term)
@@ -515,7 +560,12 @@ impl Raft {
     }
 
     fn truncate_log(&mut self, new_length: usize) {
-        for (id, log) in self.log.split_off(new_length).into_iter().enumerate() {
+        for (id, log) in self
+            .logs_mut()
+            .split_off(new_length)
+            .into_iter()
+            .enumerate()
+        {
             self.drop_entry(log.command, (id + new_length + 1) as u64);
         }
     }
@@ -523,7 +573,7 @@ impl Raft {
     fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
         let mut entries = entries;
         self.truncate_log(prev_log_index as usize);
-        self.log.append(&mut entries);
+        self.logs_mut().append(&mut entries);
         if leader_commit > self.commit_index {
             self.update_commit_index(std::cmp::min(leader_commit, self.log_length()));
         }
@@ -554,7 +604,7 @@ impl Raft {
         let half_of_server = ((self.peers_count() - 1) / 2) as usize;
         let more_than_half_matched = match_index_sorted[half_of_server];
         if more_than_half_matched > 0
-            && self.log[more_than_half_matched as usize - 1].term == self.current_term
+            && self.logs_mut()[more_than_half_matched as usize - 1].term == self.term()
         {
             self.update_commit_index(more_than_half_matched)
         }
@@ -563,7 +613,8 @@ impl Raft {
         if self.commit_index < index {
             info!("Raft #{:?}: Commited {:?}", self.me, index);
             for id in self.commit_index..index {
-                self.commit_entry(self.log[id as usize].command.clone(), id + 1)
+                let command = self.logs_mut()[id as usize].command.clone();
+                self.commit_entry(command, id + 1)
             }
             self.commit_index = index
         }
@@ -602,26 +653,12 @@ impl RaftStore {
     fn me(&self) -> u64 {
         self.raft.me as u64
     }
-    fn term(&self) -> u64 {
-        self.raft.current_term
-    }
-    fn set_term(&mut self, term: u64) {
-        if self.term() < term {
-            info!(
-                "Raft #{:?}: Enter new term {:?} -> {:?}",
-                self.me(),
-                self.term(),
-                term
-            );
-            self.raft.current_term = term
-        }
-    }
     fn role_state(&self) -> RoleState {
         self.raft.role_state()
     }
     fn request_vote(&mut self) {
         debug!("Raft #{:?}: Request vote heartbeat", self.me());
-        let term = self.term();
+        let term = self.raft.term();
         let candidate_id = self.me();
         let last_log_info = self.raft.last_log_info();
         for id in &self.raft.votes_not_respond {
@@ -639,7 +676,7 @@ impl RaftStore {
 
     fn append_entries(&mut self) {
         debug!("Raft #{:?}: Append entries heartbeat", self.me());
-        let term = self.term();
+        let term = self.raft.term();
         let leader_id = self.me();
         let leader_commit = self.raft.commit_index;
         for id in 0..self.raft.peers_count() {
@@ -663,7 +700,7 @@ impl RaftStore {
     fn start_election(&mut self) {
         info!("Raft #{:?}: Start election, become candidate", self.me());
         //go to a higher term
-        self.set_term(self.term() + 1);
+        self.raft.set_term(self.raft.term() + 1);
         //init vote states
         self.raft.reset(RoleState::Candidate);
         //update timers
@@ -673,10 +710,10 @@ impl RaftStore {
     }
 
     fn generic_request_handler(&mut self, term: u64) {
-        if term > self.term() {
+        if term > self.raft.term() {
             info!("Raft #{:?}: Found higher term, become follower", self.me());
             //update term
-            self.set_term(term);
+            self.raft.set_term(term);
             //convert to follower
             self.become_follower();
         } else {
@@ -710,7 +747,7 @@ impl RaftStore {
             .vote(args.candidate_id, args.term, args.last_log_info);
         sender
             .send(RequestVoteReply {
-                term: self.term(),
+                term: self.raft.term(),
                 vote_granted: vote,
             })
             .unwrap_or_default();
@@ -743,7 +780,7 @@ impl RaftStore {
         }
         sender
             .send(AppendEntriesReply {
-                term: self.term(),
+                term: self.raft.term(),
                 success,
             })
             .unwrap_or_default();
@@ -770,7 +807,7 @@ impl RaftStore {
 
     fn process_log(&mut self, content: Vec<u8>) {
         if self.role_state() == RoleState::Leader {
-            let term = self.term();
+            let term = self.raft.term();
             let index = self.raft.log_length() + 1;
             info!(
                 "Raft #{:?}: Add log in term {:?} at index {:?}",
