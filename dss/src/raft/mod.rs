@@ -332,6 +332,8 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        self.persisted =
+            labcodec::decode::<PersistState>(data).expect("Cannot restore from invalid data");
     }
 
     /// example code to send a RequestVote RPC to a server.
