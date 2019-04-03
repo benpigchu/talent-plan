@@ -83,4 +83,6 @@ pub struct AppendEntriesReply {
     pub term: u64,
     #[prost(bool, tag = "2")]
     pub success: bool,
+    #[prost(message, optional, tag = "3")]
+    pub reject_hint: Option<LogInfo>,
 }

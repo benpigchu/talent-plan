@@ -173,9 +173,9 @@ impl Timing {
     }
 }
 
-const ELECTION_TIMEOUT_MIN: u64 = 200;
-const ELECTION_TIMEOUT_MAX: u64 = 400;
-const HEARTBEAT_TIMEOUT: u64 = 50;
+const ELECTION_TIMEOUT_MIN: u64 = 250;
+const ELECTION_TIMEOUT_MAX: u64 = 500;
+const HEARTBEAT_TIMEOUT: u64 = 100;
 
 fn gen_election_timeout(rng: &mut ThreadRng) -> time::Duration {
     time::Duration::from_millis(rng.gen_range(ELECTION_TIMEOUT_MIN, ELECTION_TIMEOUT_MAX))
@@ -311,8 +311,10 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        trace!("Raft #{:?}: Persist state", self.me);
         let mut data = Vec::<u8>::new();
         labcodec::encode(&self.persisted, &mut data).unwrap();
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
@@ -334,6 +336,7 @@ impl Raft {
         // }
         self.persisted =
             labcodec::decode::<PersistState>(data).expect("Cannot restore from invalid data");
+        info!("Raft #{:?}: Restore state: {:?}", self.me, self.persisted);
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -494,8 +497,8 @@ impl Raft {
         self.match_index[self.me] += 1;
     }
 
-    fn last_log_info(&mut self) -> LogInfo {
-        let logs = self.logs_mut();
+    fn last_log_info(&self) -> LogInfo {
+        let logs = self.logs();
         let last_log = logs.last();
         if let Some(log) = last_log {
             LogInfo {
@@ -509,6 +512,8 @@ impl Raft {
             }
         }
     }
+
+    const ENTRIES_BATCH_SIZE: usize = 256;
 
     fn gen_heartbeat(&self, id: u64) -> (LogInfo, Vec<Log>) {
         let next_index = self.next_index[id as usize] as usize;
@@ -533,31 +538,65 @@ impl Raft {
                 log_term: 0,
             }
         };
+        let match_index = self.match_index[id as usize] as usize;
+        let entries: Vec<Log> = if match_index + 1 >= next_index {
+            // here since all entries before next is matched we send batched entries
+            self.logs()
+                .get((next_index - 1)..)
+                .into_iter()
+                .flatten()
+                .take(Self::ENTRIES_BATCH_SIZE)
+                .cloned()
+                .collect()
+        } else {
         // to be simple we only send one entry one time
-        let entries: Vec<Log> = self
-            .logs()
+            self.logs()
             .get(next_index - 1)
             .into_iter()
-            .map(Clone::clone)
-            .collect();
+                .cloned()
+                .collect()
+        };
         (prev_log_info, entries)
     }
 
-    fn check_entries_valid(&self, term: u64, prev_log_info: LogInfo) -> bool {
+    fn check_entries_valid(&self, term: u64, prev_log_info: LogInfo) -> (bool, Option<LogInfo>) {
         let LogInfo {
             log_index: prev_log_index,
             log_term: prev_log_term,
         } = prev_log_info;
         if term < self.term() {
-            false
+            (false, None)
         } else if prev_log_index < 1 {
-            true
+            (true, None)
         } else {
             let term = self
                 .logs()
                 .get(prev_log_index as usize - 1)
                 .map(|log| log.term);
-            term == Some(prev_log_term)
+            if let Some(term) = term {
+                if term == prev_log_term {
+                    (true, None)
+                } else {
+                    //TODO: add some hint
+                    (
+                        false,
+                        Some(LogInfo {
+                            log_index: self.first_index_not_early_than_term(term),
+                            log_term: term,
+                        }),
+                    )
+                }
+            } else {
+                let last_term = self.last_log_info().log_term;
+                //TODO: add some hint
+                (
+                    false,
+                    Some(LogInfo {
+                        log_index: self.first_index_not_early_than_term(last_term),
+                        log_term: last_term,
+                    }),
+                )
+            }
         }
     }
 
@@ -570,6 +609,21 @@ impl Raft {
         {
             self.drop_entry(log.command, (id + new_length + 1) as u64);
         }
+    }
+
+    fn first_index_not_early_than_term(&self, term: u64) -> u64 {
+        self.logs()
+            .binary_search_by(|log| log.term.cmp(&term).then(std::cmp::Ordering::Greater))
+            .expect_err("Binary search with something always not return equal should not return ok")
+            as u64
+            + 1
+    }
+    fn first_index_late_than_term(&self, term: u64) -> u64 {
+        self.logs()
+            .binary_search_by(|log| log.term.cmp(&term).then(std::cmp::Ordering::Less))
+            .expect_err("Binary search with something always not return equal should not return ok")
+            as u64
+            + 1
     }
 
     fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
@@ -590,10 +644,26 @@ impl Raft {
         }
     }
 
-    fn append_failed(&mut self, id: u64) {
+    fn append_failed(&mut self, id: u64, reject_hint: Option<LogInfo>) {
         let id = id as usize;
         if self.next_index[id] > 1 {
             self.next_index[id] -= 1;
+        }
+        if let Some(hint) = reject_hint {
+            // The hint reported by follower means the log in you prev_index
+            // (or the last log when there are not that much logs)
+            // is in what term, and that term start at what index
+            if self.logs().get(hint.log_index as usize).map(|log| log.term) == Some(hint.log_term) {
+                // matched, let's check end of that term
+                let after_target_term = self.first_index_late_than_term(hint.log_term);
+                if after_target_term < self.next_index[id] {
+                    // skip to end of that term
+                    self.next_index[id] = after_target_term
+                }
+            } else {
+                // not matched, the log after beginning of that term should be dropped
+                self.next_index[id] = std::cmp::min(self.next_index[id],hint.log_index)
+            }
         }
     }
 
@@ -765,7 +835,7 @@ impl RaftStore {
             self.become_follower()
         }
         self.raft.check_leader(args.term, args.leader_id);
-        let success = self.raft.check_entries_valid(args.term, args.prev_log_info);
+        let (success, reject_hint) = self.raft.check_entries_valid(args.term, args.prev_log_info);
         if success {
             let prev_log_index = args.prev_log_info.log_index;
             if !args.entries.is_empty() {
@@ -784,13 +854,14 @@ impl RaftStore {
             .send(AppendEntriesReply {
                 term: self.raft.term(),
                 success,
+                reject_hint,
             })
             .unwrap_or_default();
     }
 
     fn process_vote(&mut self, id: u64, reply: RequestVoteReply) {
         self.generic_request_handler(reply.term);
-        if self.role_state() == RoleState::Candidate {
+        if self.role_state() == RoleState::Candidate  && reply.term==self.raft.term(){
             self.raft.update_vote(id, reply.vote_granted);
             if self.raft.check_vote() {
                 self.become_leader()
@@ -800,10 +871,12 @@ impl RaftStore {
 
     fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply, entries_count: u64) {
         self.generic_request_handler(reply.term);
+        if self.role_state()==RoleState::Leader && reply.term==self.raft.term(){
         if reply.success {
             self.raft.append_success(id, entries_count)
         } else {
-            self.raft.append_failed(id)
+                self.raft.append_failed(id, reply.reject_hint)
+            }
         }
     }
 
@@ -888,6 +961,7 @@ impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
+        let me=raft.me;
         let (sender, receiver) = mpsc::unbounded::<Command>();
         let sender_clone = sender.clone();
         let state = Arc::new(Mutex::new(DetailedState {
@@ -898,7 +972,7 @@ impl Node {
             expected_log_length: 0,
         }));
         let state_clone = state.clone();
-        thread::spawn(move || raft_thread(raft, state_clone, receiver, sender_clone));
+        thread::Builder::new().name(format!("Raft #{:?}",me)).spawn(move || raft_thread(raft, state_clone, receiver, sender_clone)).unwrap();
         Node { sender, state }
     }
 
@@ -1033,6 +1107,7 @@ fn raft_thread(
         raft_store.process_task(task);
 
         //update state
+        raft_store.raft.persist();
         raft_store.update_state()
     }
 }
