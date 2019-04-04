@@ -634,7 +634,7 @@ impl Raft {
         if new_match_index > 0
             && self
                 .logs()
-                .get(prev_log_index as usize + entries.len() - 1)
+                .get(new_match_index - 1)
                 .map(|log| log.term)
                 != entries.last().map(|log| log.term)
         {
@@ -642,7 +642,7 @@ impl Raft {
             self.logs_mut().append(&mut entries);
         }
         if leader_commit > self.commit_index {
-            self.update_commit_index(std::cmp::min(leader_commit, self.log_length()));
+            self.update_commit_index(std::cmp::min(leader_commit, new_match_index as u64));
         }
     }
 
