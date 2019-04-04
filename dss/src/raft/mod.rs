@@ -393,14 +393,14 @@ impl Raft {
         // let (tx, rx) = channel();
         trace!("Raft #{:?}: Send append entries {:?}", self.me, args);
         let sender_clone = sender.clone();
-        let entries_count = args.entries.len() as u64;
+        let expected_match_index = args.prev_log_info.log_index + args.entries.len() as u64;
         peer.spawn(
             peer.append_entries(&args)
                 .map_err(|err| ())
                 .and_then(move |res| {
                     push_inbound(
                         &sender_clone,
-                        Incoming::Feedback(server as u64, res, entries_count),
+                        Incoming::Feedback(server as u64, res, expected_match_index),
                     );
                     Ok(())
                 }),
@@ -513,7 +513,7 @@ impl Raft {
         }
     }
 
-    const ENTRIES_BATCH_SIZE: usize = 256;
+    const ENTRIES_BATCH_SIZE: usize = 512;
 
     fn gen_heartbeat(&self, id: u64) -> (LogInfo, Vec<Log>) {
         let next_index = self.next_index[id as usize] as usize;
@@ -549,10 +549,10 @@ impl Raft {
                 .cloned()
                 .collect()
         } else {
-        // to be simple we only send one entry one time
+            // to be simple we only send one entry one time
             self.logs()
-            .get(next_index - 1)
-            .into_iter()
+                .get(next_index - 1)
+                .into_iter()
                 .cloned()
                 .collect()
         };
@@ -628,18 +628,30 @@ impl Raft {
 
     fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
         let mut entries = entries;
-        self.truncate_log(prev_log_index as usize);
-        self.logs_mut().append(&mut entries);
+        let new_match_index = prev_log_index as usize + entries.len();
+        // do nothing if there is new entries but all entries is matched
+        // which indicate a duplicate request
+        if new_match_index > 0
+            && self
+                .logs()
+                .get(prev_log_index as usize + entries.len() - 1)
+                .map(|log| log.term)
+                != entries.last().map(|log| log.term)
+        {
+            self.truncate_log(prev_log_index as usize);
+            self.logs_mut().append(&mut entries);
+        }
         if leader_commit > self.commit_index {
             self.update_commit_index(std::cmp::min(leader_commit, self.log_length()));
         }
     }
 
-    fn append_success(&mut self, id: u64, entries_count: u64) {
+    fn append_success(&mut self, id: u64, expected_match_index: u64) {
         let id = id as usize;
-        self.next_index[id] += entries_count;
-        self.match_index[id] = self.next_index[id] - 1;
-        if entries_count > 0 {
+        let updated = expected_match_index > self.match_index[id];
+        if updated {
+            self.next_index[id] = expected_match_index + 1;
+            self.match_index[id] = expected_match_index;
             self.check_commit();
         }
     }
@@ -662,8 +674,11 @@ impl Raft {
                 }
             } else {
                 // not matched, the log after beginning of that term should be dropped
-                self.next_index[id] = std::cmp::min(self.next_index[id],hint.log_index)
+                self.next_index[id] = std::cmp::min(self.next_index[id], hint.log_index)
             }
+        }
+        if self.next_index[id] <= self.match_index[id] {
+            self.next_index[id] = self.match_index[id] + 1;
         }
     }
 
@@ -861,7 +876,7 @@ impl RaftStore {
 
     fn process_vote(&mut self, id: u64, reply: RequestVoteReply) {
         self.generic_request_handler(reply.term);
-        if self.role_state() == RoleState::Candidate  && reply.term==self.raft.term(){
+        if self.role_state() == RoleState::Candidate && reply.term == self.raft.term() {
             self.raft.update_vote(id, reply.vote_granted);
             if self.raft.check_vote() {
                 self.become_leader()
@@ -869,12 +884,12 @@ impl RaftStore {
         }
     }
 
-    fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply, entries_count: u64) {
+    fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply, expected_match_index: u64) {
         self.generic_request_handler(reply.term);
-        if self.role_state()==RoleState::Leader && reply.term==self.raft.term(){
-        if reply.success {
-            self.raft.append_success(id, entries_count)
-        } else {
+        if self.role_state() == RoleState::Leader && reply.term == self.raft.term() {
+            if reply.success {
+                self.raft.append_success(id, expected_match_index)
+            } else {
                 self.raft.append_failed(id, reply.reject_hint)
             }
         }
@@ -921,8 +936,8 @@ impl RaftStore {
                 self.process_append_entries(arg, sender)
             }
             (_, Task::Packet(Incoming::Vote(id, reply))) => self.process_vote(id, reply),
-            (_, Task::Packet(Incoming::Feedback(id, reply, entries_count))) => {
-                self.process_feedback(id, reply, entries_count)
+            (_, Task::Packet(Incoming::Feedback(id, reply, expected_match_index))) => {
+                self.process_feedback(id, reply, expected_match_index)
             }
             (_, Task::Packet(Incoming::Log(content))) => self.process_log(content),
         }
@@ -961,7 +976,7 @@ impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        let me=raft.me;
+        let me = raft.me;
         let (sender, receiver) = mpsc::unbounded::<Command>();
         let sender_clone = sender.clone();
         let state = Arc::new(Mutex::new(DetailedState {
@@ -972,7 +987,10 @@ impl Node {
             expected_log_length: 0,
         }));
         let state_clone = state.clone();
-        thread::Builder::new().name(format!("Raft #{:?}",me)).spawn(move || raft_thread(raft, state_clone, receiver, sender_clone)).unwrap();
+        thread::Builder::new()
+            .name(format!("Raft #{:?}", me))
+            .spawn(move || raft_thread(raft, state_clone, receiver, sender_clone))
+            .unwrap();
         Node { sender, state }
     }
 
