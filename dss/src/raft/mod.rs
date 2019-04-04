@@ -48,9 +48,12 @@ impl State {
     }
 }
 
+/// This is the state shared between Node struct and the Raft thread
 #[derive(Clone, Debug)]
 struct DetailedState {
     state: State,
+    // This field is write by Node when the Node is leader.
+    // In any other case, the Raft thread write it.
     expected_log_length: u64,
 }
 
@@ -62,7 +65,7 @@ enum RoleState {
     Leader,
 }
 
-/// type of messages recieved from other
+/// Type of messages recieved from other
 #[derive(Debug)]
 enum Incoming {
     RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
@@ -72,7 +75,7 @@ enum Incoming {
     Log(Vec<u8>),
 }
 
-///Message to the raft thread
+/// Message to the raft thread
 #[derive(Debug)]
 enum Command {
     Inbound(Incoming),
@@ -85,28 +88,21 @@ fn push_inbound(sender: &mpsc::UnboundedSender<Command>, incoming: Incoming) {
         .unwrap_or_default();
 }
 
-/// type of timer timeout
+/// Type of timer timeout
 #[derive(Debug)]
 enum TimeoutType {
     Heartbeat,
     Election,
 }
 
-/// type of task to be processed
+/// Type of task to be processed
 #[derive(Debug)]
 enum Task {
     Packet(Incoming),
     Timeout(TimeoutType),
 }
 
-/// infomation related to timers
-#[derive(Debug)]
-struct Timing {
-    rng: ThreadRng,
-    heartbeat_timeout: Option<time::Instant>,
-    election_timeout: Option<time::Instant>,
-}
-
+/// The state that need to be persist
 #[derive(Message)]
 struct PersistState {
     #[prost(uint64, tag = "1")]
@@ -115,6 +111,14 @@ struct PersistState {
     voted_for: Option<u64>,
     #[prost(message, repeated, tag = "3")]
     logs: Vec<Log>,
+}
+
+// Infomation related to timers
+#[derive(Debug)]
+struct Timing {
+    rng: ThreadRng,
+    heartbeat_timeout: Option<time::Instant>,
+    election_timeout: Option<time::Instant>,
 }
 
 impl Timing {
@@ -193,27 +197,26 @@ pub struct Raft {
     persister: Box<dyn Persister>,
     // this peer's index into peers[]
     me: usize,
-    // state: Arc<State>,
     apply_ch: mpsc::UnboundedSender<ApplyMsg>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
     persisted: PersistState,
-    // current_term: u64,
-    // log: Vec<Log>,
+    // current_term: u64, // This field is now in persisted
+    // log: Vec<Log>, // This field is now in persisted
     commit_index: u64,
     last_applied: u64,
 
-    // if leader is self, we are leader
+    // If leader is self, we are leader
     leader_id: Option<u64>,
-    // if voted for self, we are candidate
-    // voted_for: Option<u64>,//this field is now in persisted
+    // If voted for self, we are candidate
+    // voted_for: Option<u64>, // This field is now in persisted
     // elsewise, we are follower
 
-    // special states for candidate
+    // Special states for candidate
     votes_granted: HashSet<u64>,
     votes_not_respond: HashSet<u64>,
-    // special states for leader
+    // Special states for leader
     next_index: Vec<u64>,
     match_index: Vec<u64>,
 }
@@ -240,7 +243,6 @@ impl Raft {
             peers,
             persister,
             me,
-            // state: Arc::default(),
             apply_ch,
             persisted: PersistState {
                 current_term: 0,
@@ -281,6 +283,7 @@ impl Raft {
     fn term(&self) -> u64 {
         self.persisted.current_term
     }
+
     fn set_term(&mut self, term: u64) {
         if self.persisted.current_term < term {
             info!(
@@ -291,7 +294,15 @@ impl Raft {
         }
     }
 
-    /// a helper used to get the current role state
+    fn peers_count(&self) -> u64 {
+        self.peers.len() as u64
+    }
+
+    fn log_length(&self) -> u64 {
+        self.persisted.logs.len() as u64
+    }
+
+    /// A helper used to get the current role state
     fn role_state(&self) -> RoleState {
         if self.leader_id == Some(self.me as u64) {
             return RoleState::Leader;
@@ -414,14 +425,6 @@ impl Raft {
         }
     }
 
-    fn peers_count(&self) -> u64 {
-        self.peers.len() as u64
-    }
-
-    fn log_length(&self) -> u64 {
-        self.persisted.logs.len() as u64
-    }
-
     fn reset(&mut self, role_state: RoleState) {
         match role_state {
             RoleState::Follower => {
@@ -457,11 +460,13 @@ impl Raft {
         }
     }
 
+    /// Decide should I vote for the candidate
     fn vote(&mut self, id: u64, term: u64, log_info: LogInfo) -> bool {
         let vote = if let Some(voted_id) = self.voted_for() {
             id == voted_id
         } else if self.term() <= term {
             let self_log_info = self.last_log_info();
+            // The vote restriction
             debug!(
                 "Raft #{:?}: Check vote for {:?}, Self: {:?}, Candidate: {:?}",
                 self.me, id, self_log_info, log_info
@@ -540,7 +545,8 @@ impl Raft {
         };
         let match_index = self.match_index[id as usize] as usize;
         let entries: Vec<Log> = if match_index + 1 >= next_index {
-            // here since all entries before next is matched we send batched entries
+            // Here since all entries before next is matched
+            // append entries should always success,so we send batched entries
             self.logs()
                 .get((next_index - 1)..)
                 .into_iter()
@@ -549,7 +555,7 @@ impl Raft {
                 .cloned()
                 .collect()
         } else {
-            // to be simple we only send one entry one time
+            // To be simple we only send one entry one time
             self.logs()
                 .get(next_index - 1)
                 .into_iter()
@@ -559,7 +565,24 @@ impl Raft {
         (prev_log_info, entries)
     }
 
+    fn first_index_not_early_than_term(&self, term: u64) -> u64 {
+        self.logs()
+            .binary_search_by(|log| log.term.cmp(&term).then(std::cmp::Ordering::Greater))
+            .expect_err("Binary search with something always not return equal should not return ok")
+            as u64
+            + 1
+    }
+
+    fn first_index_late_than_term(&self, term: u64) -> u64 {
+        self.logs()
+            .binary_search_by(|log| log.term.cmp(&term).then(std::cmp::Ordering::Less))
+            .expect_err("Binary search with something always not return equal should not return ok")
+            as u64
+            + 1
+    }
+
     fn check_entries_valid(&self, term: u64, prev_log_info: LogInfo) -> (bool, Option<LogInfo>) {
+        // See append_failed function for description of the secoond return value hint
         let LogInfo {
             log_index: prev_log_index,
             log_term: prev_log_term,
@@ -577,7 +600,6 @@ impl Raft {
                 if term == prev_log_term {
                     (true, None)
                 } else {
-                    //TODO: add some hint
                     (
                         false,
                         Some(LogInfo {
@@ -588,7 +610,6 @@ impl Raft {
                 }
             } else {
                 let last_term = self.last_log_info().log_term;
-                //TODO: add some hint
                 (
                     false,
                     Some(LogInfo {
@@ -611,25 +632,10 @@ impl Raft {
         }
     }
 
-    fn first_index_not_early_than_term(&self, term: u64) -> u64 {
-        self.logs()
-            .binary_search_by(|log| log.term.cmp(&term).then(std::cmp::Ordering::Greater))
-            .expect_err("Binary search with something always not return equal should not return ok")
-            as u64
-            + 1
-    }
-    fn first_index_late_than_term(&self, term: u64) -> u64 {
-        self.logs()
-            .binary_search_by(|log| log.term.cmp(&term).then(std::cmp::Ordering::Less))
-            .expect_err("Binary search with something always not return equal should not return ok")
-            as u64
-            + 1
-    }
-
     fn apply_log(&mut self, prev_log_index: u64, entries: Vec<Log>, leader_commit: u64) {
         let mut entries = entries;
         let new_match_index = prev_log_index as usize + entries.len();
-        // do nothing if there is new entries but all entries is matched
+        // Do nothing if there is new entries but all entries is matched
         // which indicate a duplicate request
         if new_match_index > 0
             && self
@@ -666,14 +672,14 @@ impl Raft {
             // (or the last log when there are not that much logs)
             // is in what term, and that term start at what index
             if self.logs().get(hint.log_index as usize).map(|log| log.term) == Some(hint.log_term) {
-                // matched, let's check end of that term
+                // Matched, let's check end of that term
                 let after_target_term = self.first_index_late_than_term(hint.log_term);
                 if after_target_term < self.next_index[id] {
-                    // skip to end of that term
+                    // Skip to end of that term
                     self.next_index[id] = after_target_term
                 }
             } else {
-                // not matched, the log after beginning of that term should be dropped
+                // Not matched, the log after beginning of that term should be dropped
                 self.next_index[id] = std::cmp::min(self.next_index[id], hint.log_index)
             }
         }
@@ -682,12 +688,13 @@ impl Raft {
         }
     }
 
+    /// Try to update commit_index from match_index
     fn check_commit(&mut self) {
         // a not that naive but not best implemention
+        // maybe using a heap is a better approach?
         let mut match_index_sorted = self.match_index.clone();
         match_index_sorted.sort_unstable();
-        debug!("Raft #{:?}: Match {:?}", self.me, match_index_sorted);
-
+        trace!("Raft #{:?}: Match {:?}", self.me, match_index_sorted);
         let half_of_server = ((self.peers_count() - 1) / 2) as usize;
         let more_than_half_matched = match_index_sorted[half_of_server];
         if more_than_half_matched > 0
@@ -696,6 +703,7 @@ impl Raft {
             self.update_commit_index(more_than_half_matched)
         }
     }
+
     fn update_commit_index(&mut self, index: u64) {
         if self.commit_index < index {
             info!("Raft #{:?}: Commited {:?}", self.me, index);
@@ -740,9 +748,11 @@ impl RaftStore {
     fn me(&self) -> u64 {
         self.raft.me as u64
     }
+
     fn role_state(&self) -> RoleState {
         self.raft.role_state()
     }
+
     fn request_vote(&mut self) {
         debug!("Raft #{:?}: Request vote heartbeat", self.me());
         let term = self.raft.term();
@@ -786,40 +796,43 @@ impl RaftStore {
 
     fn start_election(&mut self) {
         info!("Raft #{:?}: Start election, become candidate", self.me());
-        //go to a higher term
+        // Go to a higher term
         self.raft.set_term(self.raft.term() + 1);
-        //init vote states
+        // Init vote states
         self.raft.reset(RoleState::Candidate);
-        //update timers
+        // Update timers
         self.timing.reset_when_become(RoleState::Candidate);
-        //send vote request
+        // Send vote request
         self.request_vote();
     }
 
     fn generic_request_handler(&mut self, term: u64) {
         if term > self.raft.term() {
             info!("Raft #{:?}: Found higher term, become follower", self.me());
-            //update term
+            // Update term
             self.raft.set_term(term);
-            //convert to follower
+            // Convert to follower
             self.become_follower();
         } else {
+            // Reset
             self.timing.reset_election_timeout()
         }
     }
 
     fn become_leader(&mut self) {
         info!("Raft #{:?}: Vote granted, become leader", self.me());
-        // set leader
+        // Set leader
         self.raft.reset(RoleState::Leader);
-        // reset timer
+        // Reset timer
         self.timing.reset_when_become(RoleState::Leader);
-        // send heartbeat
+        // Send heartbeat
         self.append_entries()
     }
 
     fn become_follower(&mut self) {
+        // Reset state
         self.raft.reset(RoleState::Follower);
+        // Reset timer
         self.timing.reset_when_become(RoleState::Follower)
     }
 
@@ -829,6 +842,7 @@ impl RaftStore {
         sender: oneshot::Sender<RequestVoteReply>,
     ) {
         self.generic_request_handler(args.term);
+        // Decide vote
         let vote = self
             .raft
             .vote(args.candidate_id, args.term, args.last_log_info);
@@ -846,15 +860,18 @@ impl RaftStore {
         sender: oneshot::Sender<AppendEntriesReply>,
     ) {
         self.generic_request_handler(args.term);
-        if self.role_state() == RoleState::Candidate {
+        // Only react to higher term leader
+        if args.term>=self.raft.term() && self.role_state() == RoleState::Candidate {
             self.become_follower()
         }
         self.raft.check_leader(args.term, args.leader_id);
+        // Check entries valid
         let (success, reject_hint) = self.raft.check_entries_valid(args.term, args.prev_log_info);
         if success {
+            // Append entries on calid
             let prev_log_index = args.prev_log_info.log_index;
             if !args.entries.is_empty() {
-                info!(
+                debug!(
                     "Raft #{:?}: Apply entries from {:?} in range {:?} to {:?}",
                     self.me(),
                     args.leader_id,
@@ -876,8 +893,11 @@ impl RaftStore {
 
     fn process_vote(&mut self, id: u64, reply: RequestVoteReply) {
         self.generic_request_handler(reply.term);
+        // Reject vote from lower term
         if self.role_state() == RoleState::Candidate && reply.term == self.raft.term() {
+            // Update vote status
             self.raft.update_vote(id, reply.vote_granted);
+            // Check leader request
             if self.raft.check_vote() {
                 self.become_leader()
             }
@@ -886,6 +906,7 @@ impl RaftStore {
 
     fn process_feedback(&mut self, id: u64, reply: AppendEntriesReply, expected_match_index: u64) {
         self.generic_request_handler(reply.term);
+        // Reject feedback from lower term
         if self.role_state() == RoleState::Leader && reply.term == self.raft.term() {
             if reply.success {
                 self.raft.append_success(id, expected_match_index)
@@ -897,6 +918,7 @@ impl RaftStore {
 
     fn process_log(&mut self, content: Vec<u8>) {
         if self.role_state() == RoleState::Leader {
+            // Add log for leader
             let term = self.raft.term();
             let index = self.raft.log_length() + 1;
             info!(
@@ -942,6 +964,7 @@ impl RaftStore {
             (_, Task::Packet(Incoming::Log(content))) => self.process_log(content),
         }
     }
+
     fn update_state(&mut self) {
         let mut detailed_state = self.state.lock().unwrap();
         detailed_state.state = self.raft.state();
@@ -987,6 +1010,7 @@ impl Node {
             expected_log_length: 0,
         }));
         let state_clone = state.clone();
+        // Spawn the raft thread
         thread::Builder::new()
             .name(format!("Raft #{:?}", me))
             .spawn(move || raft_thread(raft, state_clone, receiver, sender_clone))
@@ -1020,7 +1044,7 @@ impl Node {
         // Your code here (2B).
 
         if detailed_state.state.is_leader {
-            //index here start from 1
+            // Index here start from 1
             detailed_state.expected_log_length += 1;
             let index = detailed_state.expected_log_length;
             push_inbound(&self.sender, Incoming::Log(buf));
@@ -1094,23 +1118,23 @@ fn raft_thread(
     let mut receiver_future = receiver.into_future();
     info!("Raft #{:?}: Node created", raft_store.me());
     loop {
-        // select next timeout
+        // Select next timeout
         let (timeout_instant, timeout_type) = raft_store.timing.next_timeout();
         let timeout = Delay::new_at(timeout_instant);
 
-        // wait for message+timer
+        // Wait for message+timer
         let wait_result = receiver_future.select2(timeout).wait();
         let (task, new_receiver_future) = match wait_result {
             Ok(Either::A(((Some(Command::Inbound(message)), stream), _))) => {
                 (Task::Packet(message), stream.into_future())
             }
             Ok(Either::A(((Some(Command::Kill), stream), _))) => {
-                // node explicitly killed
+                // Node explicitly killed
                 info!("Raft #{:?}: Node destroyed", raft_store.me());
                 return;
             }
             Ok(Either::A(((None, stream), _))) => {
-                // no more incoming message to execute, the sender is dropped and the node is destroyed
+                // No more incoming message to execute, the sender is dropped and the node is destroyed
                 info!("Raft #{:?}: Node destroyed", raft_store.me());
                 return;
             }
@@ -1121,10 +1145,10 @@ fn raft_thread(
         trace!("Raft #{:?}: Get task {:?}", raft_store.me(), task);
         receiver_future = new_receiver_future;
 
-        // process message/timeout
+        // Process message/timeout
         raft_store.process_task(task);
 
-        //update state
+        // Update state
         raft_store.raft.persist();
         raft_store.update_state()
     }
