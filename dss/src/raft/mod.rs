@@ -72,7 +72,7 @@ enum Incoming {
     AppendEntries(AppendEntriesArgs, oneshot::Sender<AppendEntriesReply>),
     Vote(u64, RequestVoteReply),
     Feedback(u64, AppendEntriesReply, u64),
-    Log(Vec<u8>),
+    Log(Vec<u8>, u64),
 }
 
 /// Message to the raft thread
@@ -638,10 +638,7 @@ impl Raft {
         // Do nothing if there is new entries but all entries is matched
         // which indicate a duplicate request
         if new_match_index > 0
-            && self
-                .logs()
-                .get(new_match_index - 1)
-                .map(|log| log.term)
+            && self.logs().get(new_match_index - 1).map(|log| log.term)
                 != entries.last().map(|log| log.term)
         {
             self.truncate_log(prev_log_index as usize);
@@ -861,7 +858,7 @@ impl RaftStore {
     ) {
         self.generic_request_handler(args.term);
         // Only react to higher term leader
-        if args.term>=self.raft.term() && self.role_state() == RoleState::Candidate {
+        if args.term >= self.raft.term() && self.role_state() == RoleState::Candidate {
             self.become_follower()
         }
         self.raft.check_leader(args.term, args.leader_id);
@@ -916,8 +913,8 @@ impl RaftStore {
         }
     }
 
-    fn process_log(&mut self, content: Vec<u8>) {
-        if self.role_state() == RoleState::Leader {
+    fn process_log(&mut self, content: Vec<u8>, term: u64) {
+        if self.raft.term() == term && self.role_state() == RoleState::Leader {
             // Add log for leader
             let term = self.raft.term();
             let index = self.raft.log_length() + 1;
@@ -961,7 +958,7 @@ impl RaftStore {
             (_, Task::Packet(Incoming::Feedback(id, reply, expected_match_index))) => {
                 self.process_feedback(id, reply, expected_match_index)
             }
-            (_, Task::Packet(Incoming::Log(content))) => self.process_log(content),
+            (_, Task::Packet(Incoming::Log(content, term))) => self.process_log(content, term),
         }
     }
 
@@ -1047,7 +1044,7 @@ impl Node {
             // Index here start from 1
             detailed_state.expected_log_length += 1;
             let index = detailed_state.expected_log_length;
-            push_inbound(&self.sender, Incoming::Log(buf));
+            push_inbound(&self.sender, Incoming::Log(buf, detailed_state.state.term));
             Ok((index, detailed_state.state.term))
         } else {
             Err(Error::NotLeader)
