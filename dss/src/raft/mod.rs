@@ -810,7 +810,7 @@ impl RaftStore {
             self.raft.set_term(term);
             // Convert to follower
             self.become_follower();
-        } else {
+        } else if self.role_state() == RoleState::Follower {
             // Reset
             self.timing.reset_election_timeout()
         }
